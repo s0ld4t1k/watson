@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Watson: evidence-first OSINT triage for scam reports.
 
-Public web checks and Telegram data visible to the authenticated user are
-summarised as leads, never as proof of identity. No private data is acquired;
-locally supplied investigation evidence may be processed and correlated.
+Public web checks, breach-exposure status (names, dates and data classes
+only) and Telegram data visible to the authenticated user are summarised as
+leads, never as proof of identity. Raw breach dumps and private databases are
+not fetched; locally supplied investigation evidence may be processed and
+correlated.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import datetime as dt
 import hashlib
 import html
 import json
+import os
 import re
 import socket
 import sqlite3
@@ -72,7 +75,7 @@ def cache_db() -> sqlite3.Connection:
     return con
 
 
-def fetch(url: str, ttl: int = CACHE_TTL, timeout: int = 12) -> tuple[int, str]:
+def fetch(url: str, ttl: int = CACHE_TTL, timeout: int = 12, headers: dict | None = None) -> tuple[int, str]:
     """Cached GET using only the standard library."""
     con = cache_db()
     row = con.execute("SELECT status, body, ts FROM c WHERE url=?", (url,)).fetchone()
@@ -80,13 +83,16 @@ def fetch(url: str, ttl: int = CACHE_TTL, timeout: int = 12) -> tuple[int, str]:
         con.close()
         return row[0], row[1]
     try:
-        request = Request(url, headers=UA)
+        request = Request(url, headers={**UA, **(headers or {})})
         with urlopen(request, timeout=timeout) as response:
             status, body = response.status, response.read().decode("utf-8", "replace")
-    except (HTTPError, URLError, TimeoutError, OSError):
+    except HTTPError as exc:
+        con.close()
+        return exc.code, ""
+    except (URLError, TimeoutError, OSError):
         con.close()
         return 0, ""
-    if status < 500:
+    if status < 500 and status not in (403, 429):
         con.execute("REPLACE INTO c VALUES (?,?,?,?)", (url, status, body, time.time()))
         con.commit()
     con.close()
@@ -428,7 +434,7 @@ def scan_email(target: str) -> dict:
     domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
     add(rep, "Домен", domain)
     rep["links"].append(("Google: email", f"https://www.google.com/search?q={quote(chr(34) + address + chr(34))}"))
-    rep["notes"].append("Публичные совпадения email являются зацепками; утечки и закрытые базы Watson не запрашивает.")
+    rep["notes"].append("Публичные совпадения email являются зацепками; сырые дампы и закрытые базы Watson не запрашивает.")
     return rep
 
 
@@ -522,7 +528,32 @@ def scan_domain(target: str) -> dict:
         names = {name for item in certs for name in item.get("name_value", "").split("\n")}
         add(rep, "Сертификатов crt.sh", len(certs))
         add(rep, "Поддомены (до 10)", ", ".join(sorted(name for name in names if name != domain)[:10]))
-    rep["links"] += [("VirusTotal", f"https://www.virustotal.com/gui/domain/{domain}"), ("urlscan.io", f"https://urlscan.io/search/#domain:{domain}"), ("Wayback Machine", f"https://web.archive.org/web/*/{domain}"), ("WHOIS", f"https://who.is/whois/{domain}")]
+    status, otx = fetch_json(f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/general", timeout=20)
+    if isinstance(otx, dict):
+        pulses = int(((otx.get("pulse_info") or {}).get("count")) or 0)
+        add(rep, "AlienVault OTX: упоминаний в threat-пульсах", pulses)
+        whitelisted = any(
+            "whitelist" in (str(item.get("name", "")) + str(item.get("message", ""))).lower()
+            for item in otx.get("validation") or []
+            if isinstance(item, dict)
+        )
+        if whitelisted:
+            rep["notes"].append("OTX помечает домен как whitelisted; упоминания в пульсах не учитывались в оценке риска.")
+        elif pulses >= 5:
+            flag(rep, 3, f"Домен встречается в {pulses} публичных threat-пульсах OTX")
+        elif pulses:
+            flag(rep, 1, f"Домен встречается в {pulses} threat-пульсах OTX")
+    else:
+        rep["notes"].append(f"AlienVault OTX недоступен (статус {status}).")
+    status, scan = fetch_json("https://urlscan.io/api/v1/search/?q=" + quote(f"domain:{domain}"), timeout=20)
+    if isinstance(scan, dict):
+        scanned = int(scan.get("total") or 0)
+        add(rep, "urlscan.io: публичных сканов", scanned)
+        if scanned:
+            rep["notes"].append("Наличие сканов urlscan.io означает, что домен уже проверяли другие исследователи.")
+    else:
+        rep["notes"].append(f"urlscan.io недоступен (статус {status}).")
+    rep["links"] += [("VirusTotal", f"https://www.virustotal.com/gui/domain/{domain}"), ("urlscan.io", f"https://urlscan.io/search/#domain:{domain}"), ("AlienVault OTX", f"https://otx.alienvault.com/indicator/domain/{domain}"), ("Wayback Machine", f"https://web.archive.org/web/*/{domain}"), ("WHOIS", f"https://who.is/whois/{domain}")]
     return rep
 
 
@@ -567,6 +598,231 @@ def scan_crypto(target: str) -> dict:
     return rep
 
 
+# Breach exposure status: names, dates and data classes only, never the values
+_BREACH_LAST: dict[str, float] = {}
+
+
+def throttle(key: str, interval: float) -> None:
+    wait = interval - (time.time() - _BREACH_LAST.get(key, 0.0))
+    if wait > 0:
+        time.sleep(wait)
+    _BREACH_LAST[key] = time.time()
+
+
+def breach_kind(identifier: str) -> str:
+    value = str(identifier).strip()
+    if EMAIL_RE.fullmatch(value):
+        return "email"
+    if re.fullmatch(r"\+?\d[\d\s().-]{6,20}\d", value):
+        return "phone"
+    return "username"
+
+
+def leakcheck_public(query: str) -> dict:
+    result = {"source": "LeakCheck", "count": None, "breaches": [], "fields": [], "error": ""}
+    throttle("leakcheck", 1.1)
+    status, data = fetch_json(f"https://leakcheck.io/api/public?check={quote(query)}", ttl=3600, timeout=20)
+    if status == 429:
+        result["error"] = "rate limit, повторите позже"
+        return result
+    if not isinstance(data, dict):
+        result["error"] = f"HTTP {status}"
+        return result
+    if not data.get("success"):
+        result["error"] = str(data.get("message") or data.get("error") or "нет ответа")
+        return result
+    result["count"] = int(data.get("found") or 0)
+    result["breaches"] = [
+        f"{item.get('name', '?')} ({item.get('date', 'дата н/д')})"
+        for item in data.get("sources") or []
+        if isinstance(item, dict)
+    ]
+    result["fields"] = [str(field) for field in data.get("fields") or []]
+    return result
+
+
+def leakcheck_pro(query: str) -> dict:
+    result = {"source": "LeakCheck Pro", "count": None, "breaches": [], "fields": [], "error": ""}
+    key = os.getenv("WATSON_LEAKCHECK_KEY")
+    if not key:
+        return result
+    throttle("leakcheck", 1.1)
+    status, data = fetch_json(
+        f"https://leakcheck.io/api/v2/query/{quote(query)}?limit=100",
+        ttl=3600, timeout=20, headers={"X-API-Key": key, "Accept": "application/json"},
+    )
+    if status == 401:
+        result["error"] = "неверный WATSON_LEAKCHECK_KEY"
+        return result
+    if status == 429:
+        result["error"] = "rate limit, повторите позже"
+        return result
+    if not isinstance(data, dict):
+        result["error"] = f"HTTP {status}"
+        return result
+    if not data.get("success"):
+        result["error"] = str(data.get("message") or data.get("error") or "нет ответа")
+        return result
+    result["count"] = int(data.get("found") or 0)
+    breaches: set[str] = set()
+    fields: set[str] = set()
+    for row in data.get("result") or []:
+        if not isinstance(row, dict):
+            continue
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        name = str(source.get("name") or "?")
+        date = str(source.get("breach_date") or "")[:7]
+        breaches.add(f"{name} ({date})" if date else name)
+        fields.update(str(field) for field in row.get("fields") or [])
+    result["breaches"] = sorted(breaches)
+    result["fields"] = sorted(fields)
+    result["quota"] = data.get("quota")
+    return result
+
+
+def xposedornot_breaches(email: str) -> dict:
+    result = {"source": "XposedOrNot", "count": None, "breaches": [], "fields": [], "error": ""}
+    throttle("xposedornot", 0.6)
+    status, data = fetch_json(
+        "https://api.xposedornot.com/v1/breach-analytics?email=" + quote(email),
+        ttl=3600, timeout=25,
+    )
+    if status == 429:
+        result["error"] = "rate limit (25 запросов/час), повторите позже"
+        return result
+    if not isinstance(data, dict):
+        result["error"] = f"HTTP {status}"
+        return result
+    details = ((data.get("ExposedBreaches") or {}).get("breaches_details")) or []
+    fields: set[str] = set()
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        date = str(item.get("xposed_date") or "")[:7]
+        name = str(item.get("breach") or "?")
+        result["breaches"].append(f"{name} ({date})" if date else name)
+        fields.update(part.strip() for part in str(item.get("xposed_data") or "").split(";") if part.strip())
+    result["count"] = len(details)
+    result["fields"] = sorted(fields)
+    metrics = data.get("BreachMetrics") or {}
+    risk = (metrics.get("risk") or [{}])[0] if metrics.get("risk") else {}
+    if isinstance(risk, dict) and risk.get("risk_label"):
+        result["risk"] = f"{risk.get('risk_label')} ({risk.get('risk_score')})"
+    strength = (metrics.get("passwords_strength") or [{}])[0] if metrics.get("passwords_strength") else {}
+    if isinstance(strength, dict):
+        plain, weak = int(strength.get("PlainText") or 0), int(strength.get("EasyToCrack") or 0)
+        if plain or weak:
+            result["weak_passwords"] = f"открытых: {plain}, слабых: {weak}"
+    return result
+
+
+def hibp_breaches(email: str) -> dict:
+    result = {"source": "HIBP", "count": None, "breaches": [], "fields": [], "error": ""}
+    key = os.getenv("WATSON_HIBP_API_KEY")
+    if not key:
+        return result
+    throttle("hibp", 1.6)
+    status, data = fetch_json(
+        f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email, safe='@.')}?truncateResponse=false",
+        ttl=3600, timeout=20, headers={"hibp-api-key": key},
+    )
+    if status == 404:
+        result["count"] = 0
+        return result
+    if status == 401:
+        result["error"] = "неверный WATSON_HIBP_API_KEY"
+        return result
+    if status == 429:
+        result["error"] = "rate limit HIBP, повторите позже"
+        return result
+    if not isinstance(data, list):
+        result["error"] = f"HTTP {status}"
+        return result
+    result["count"] = len(data)
+    fields: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("Title") or item.get("Name") or "?")
+        date = str(item.get("BreachDate") or "")[:7]
+        result["breaches"].append(f"{title} ({date})" if date else title)
+        fields.update(str(field) for field in item.get("DataClasses") or [])
+    result["fields"] = sorted(fields)
+    return result
+
+
+def add_breach_signals(rep: dict, identifier: str) -> None:
+    value = str(identifier or "").strip()
+    if not value:
+        return
+    kind = breach_kind(value)
+    if kind == "phone":
+        rep["notes"].append("Breach-источники по номеру телефона недоступны в бесплатных API; используйте email или username.")
+        return
+    query = value.lstrip("@") if kind == "username" else value
+    results = [leakcheck_public(query)]
+    if kind == "email":
+        results.append(xposedornot_breaches(value))
+        if os.getenv("WATSON_HIBP_API_KEY"):
+            results.append(hibp_breaches(value))
+    if os.getenv("WATSON_LEAKCHECK_KEY"):
+        results.append(leakcheck_pro(query))
+
+    total, consulted, classes = 0, [], set()
+    for item in results:
+        source = item["source"]
+        if item.get("error"):
+            rep["notes"].append(f"{source}: {item['error']}")
+            continue
+        count = item.get("count")
+        if count is None:
+            continue
+        consulted.append(source)
+        total = max(total, count)
+        add(rep, f"{source}: найдено записей", count)
+        if item.get("breaches"):
+            shown = item["breaches"][:20]
+            extra = len(item["breaches"]) - len(shown)
+            add(rep, f"{source}: источники (пример)", ", ".join(shown) + (f" и ещё {extra}" if extra > 0 else ""))
+        if item.get("fields"):
+            add(rep, f"{source}: категории данных", ", ".join(item["fields"]))
+        if item.get("risk"):
+            add(rep, f"{source}: оценка риска", item["risk"])
+        if item.get("weak_passwords"):
+            add(rep, f"{source}: качество паролей", item["weak_passwords"])
+        if item.get("quota") is not None:
+            add(rep, f"{source}: остаток запросов", item["quota"])
+        classes.update(str(field).lower() for field in item.get("fields") or [])
+
+    if not consulted:
+        add(rep, "Breach-источники", "недоступны")
+        return
+    add(rep, "Проверено breach-источников", ", ".join(consulted))
+    rep["notes"].append("Возвращаются только названия утечек, даты и категории полей — не сами значения.")
+    rep["notes"].append("Наличие идентификатора в утечке не доказывает мошенничество; это зацепка для проверки повторного использования учётных данных.")
+    if total == 0:
+        add(rep, "Найдено в утечках", "нет")
+        return
+    rep["links"] += [("LeakCheck", "https://leakcheck.io/"), ("XposedOrNot", "https://xposedornot.com/data-breach-check")]
+    if kind == "email":
+        rep["links"].append(("Have I Been Pwned", f"https://haveibeenpwned.com/account/{quote(value, safe='@.')}"))
+    if kind == "username":
+        rep["notes"].append("Совпадения по username — слабая зацепка: ник не уникален между сервисами, поэтому в оценку риска они не входят.")
+        return
+    flag(rep, 1, f"Идентификатор встречается в {total} записях публичных утечек")
+    if any("password" in field or "парол" in field for field in classes):
+        flag(rep, 1, "Среди утёкших категорий — пароли: возможно повторное использование учёток")
+
+
+def scan_breach(target: str) -> dict:
+    value = target.strip()
+    kind = breach_kind(value)
+    rep = new_report("Утечки (breach-статус)", value)
+    remember(rep, {"email": "emails", "phone": "phones"}.get(kind, "usernames"), value if kind != "username" else value.lstrip("@"))
+    add_breach_signals(rep, value)
+    return rep
+
+
 # Output and CLI --------------------------------------------------------------
 def detect(value: str) -> str:
     target = value.strip()
@@ -586,11 +842,13 @@ def detect(value: str) -> str:
     return "user"
 
 
-SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export, "evidence": scan_evidence}
+SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export, "evidence": scan_evidence, "breach": scan_breach}
 
 
-def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maigret: bool = False) -> dict:
+def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maigret: bool = False, breach: bool = True) -> dict:
     rep = SCANNERS[kind](target)
+    if breach and kind in ("tg", "email", "user"):
+        add_breach_signals(rep, telegram_slug(target) if kind == "tg" else target)
     if kind in ("tg", "id") and deep:
         deep_telegram(rep, telegram_slug(target))
     if kind in ("tg", "user") and (sherlock or maigret):
@@ -657,20 +915,225 @@ def print_report(rep: dict) -> None:
     print("\n  Оценка эвристическая. Не публикуйте персональные данные.")
 
 
+RISK_COLORS = {"низкий": "#2e7d32", "средний": "#ef6c00", "высокий": "#c62828"}
+
+
+REPORT_CSS = """
+*{box-sizing:border-box}
+:root{--bg:#f5f6f8;--card:#fff;--fg:#171a1f;--muted:#67707c;--line:#dde1e7;--chip:#eef1f5;--accent:#2f6fed}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0e1116;--card:#161a20;--fg:#e7eaef;--muted:#98a2b0;--line:#282f38;--chip:#1e242c;--accent:#7aa2ff}
+}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);line-height:1.45;
+  font-family:system-ui,-apple-system,"Segoe UI","Helvetica Neue",Arial,"DejaVu Sans",sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:1.4rem 1rem 3rem}
+header h1{margin:0;font-size:1.5rem}
+.meta{color:var(--muted);font-size:.82rem;margin:.15rem 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1rem 1.15rem;
+  margin:1rem 0;break-inside:avoid;page-break-inside:avoid}
+.cardwrap{break-inside:avoid;page-break-inside:avoid}
+.head{display:flex;gap:.8rem;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+.kind{font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+h2{margin:.15rem 0 .3rem;font-size:1.12rem;word-break:break-word}
+h3{margin:1.05rem 0 .4rem;font-size:.76rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.risk{display:inline-block;color:#fff;padding:.3rem .75rem;border-radius:999px;
+  font-size:.86rem;font-weight:600;white-space:nowrap;flex:none}
+.pill{display:inline-block;color:#fff;padding:.12rem .55rem;border-radius:999px;font-size:.78rem;font-weight:600}
+table{border-collapse:collapse;width:100%}
+th,td{padding:.4rem .5rem;border-bottom:1px solid var(--line);text-align:left;
+  vertical-align:top;word-break:break-word;font-size:.92rem}
+th{font-weight:600}
+table.data th{width:34%;color:var(--muted)}
+thead th{width:auto;color:var(--muted);font-size:.76rem;letter-spacing:.05em;text-transform:uppercase}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr:last-child td,tr:last-child th{border-bottom:0}
+ul{margin:.2rem 0;padding-left:1.1rem}
+li{margin:.2rem 0}
+.pts{display:inline-block;min-width:2.5rem;font-weight:700;font-variant-numeric:tabular-nums;color:#c62828}
+.muted,.notes li{color:var(--muted);font-size:.82rem}
+.links{display:flex;flex-wrap:wrap;gap:.35rem}
+.btn{display:inline-block;padding:.35rem .7rem;border:1px solid var(--line);border-radius:8px;
+  background:var(--chip);color:var(--fg);text-decoration:none;font-size:.85rem}
+.btn:hover{border-color:var(--accent)}
+a{color:var(--accent)}
+.footer{color:var(--muted);font-size:.8rem;text-align:center;margin:2rem 0 0}
+.tbar{display:flex;gap:.4rem;align-items:center;margin:.7rem 0 .3rem;flex-wrap:wrap}
+.tbar input{flex:1 1 12rem;min-width:0;padding:.4rem .6rem;border:1px solid var(--line);
+  border-radius:8px;background:var(--bg);color:var(--fg);font-size:.85rem}
+.tbar button{padding:.35rem .65rem;border:1px solid var(--line);border-radius:8px;
+  background:var(--chip);color:var(--fg);font-size:.95rem;cursor:pointer}
+.tbar button:disabled{opacity:.4;cursor:default}
+.tinfo{color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
+@media (max-width:600px){
+  .wrap{padding:1rem .7rem 2rem}
+  .head{gap:.5rem}
+  table.data tr{display:block;margin:.55rem 0}
+  table.data th,table.data td{display:block;width:auto;border:0;padding:.05rem 0}
+  table.data th{font-size:.78rem}
+}
+@media print{
+  :root{--bg:#fff;--card:#fff;--fg:#000;--muted:#333;--line:#999;--chip:#f2f2f2;--accent:#000}
+  body{background:#fff}
+  .wrap{padding:0;max-width:none}
+  .card{border:1px solid #999;break-inside:avoid;page-break-inside:avoid;margin:.6rem 0}
+  .tbar{display:none}
+  tbody tr{display:table-row !important}
+  a{color:#000;text-decoration:none}
+  .btn{border:1px solid #999;background:#f5f5f5;color:#000}
+  .pts{color:#000}
+}
+*{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+@page{margin:12mm}
+"""
+
+
+TABLE_JS = """
+(function () {
+  function wire(table) {
+    var body = table.tBodies[0];
+    if (!body) return;
+    var rows = Array.prototype.slice.call(body.rows);
+    if (rows.length <= 10) return;
+    var page = 0, query = "";
+
+    var bar = document.createElement("div");
+    bar.className = "tbar";
+
+    var input = document.createElement("input");
+    input.type = "search";
+    input.placeholder = "Поиск по таблице\\u2026";
+    input.setAttribute("aria-label", "Поиск по таблице");
+
+    var info = document.createElement("span");
+    info.className = "tinfo";
+
+    var prev = document.createElement("button");
+    prev.type = "button";
+    prev.textContent = "\\u2039";
+    prev.setAttribute("aria-label", "Предыдущая страница");
+
+    var next = document.createElement("button");
+    next.type = "button";
+    next.textContent = "\\u203a";
+    next.setAttribute("aria-label", "Следующая страница");
+
+    bar.appendChild(input);
+    bar.appendChild(info);
+    bar.appendChild(prev);
+    bar.appendChild(next);
+    table.parentNode.insertBefore(bar, table);
+
+    function render() {
+      var filtered = rows.filter(function (row) {
+        return !query || row.textContent.toLowerCase().indexOf(query) !== -1;
+      });
+      var pages = Math.max(1, Math.ceil(filtered.length / 10));
+      if (page > pages - 1) page = pages - 1;
+      if (page < 0) page = 0;
+      rows.forEach(function (row) { row.style.display = "none"; });
+      filtered.slice(page * 10, page * 10 + 10).forEach(function (row) { row.style.display = ""; });
+      info.textContent = filtered.length ? (page + 1) + "/" + pages + " \\u00b7 " + filtered.length : "0";
+      prev.disabled = page <= 0;
+      next.disabled = page >= pages - 1;
+    }
+
+    input.addEventListener("input", function () {
+      query = input.value.trim().toLowerCase();
+      page = 0;
+      render();
+    });
+    prev.addEventListener("click", function () { if (page > 0) { page -= 1; render(); } });
+    next.addEventListener("click", function () { page += 1; render(); });
+    render();
+  }
+
+  function init() {
+    var tables = document.querySelectorAll("table[data-paginate]");
+    Array.prototype.forEach.call(tables, wire);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+"""
+
+
 def html_report(rep: dict) -> str:
     score, level = risk(rep)
     escape = html.escape
-    rows = "".join(f"<tr><th>{escape(str(label))}</th><td>{escape(str(value))}</td></tr>" for label, value in rep["findings"])
-    flags = "".join(f"<li>+{points}: {escape(reason)}</li>" for points, reason in rep["flags"] if reason) or "<li>признаков не найдено</li>"
-    notes = "".join(f"<li>{escape(note)}</li>" for note in rep["notes"])
-    links = "".join(f'<li><a href="{escape(url)}" rel="noopener noreferrer">{escape(name)}</a></li>' for name, url in rep["links"])
-    colors = {"низкий": "#2e7d32", "средний": "#ef6c00", "высокий": "#c62828"}
-    return f'<section class="card"><h2>{escape(rep["type"])}: {escape(rep["target"])}</h2><p class="risk" style="background:{colors[level]}">Риск: {level} ({score})</p><table>{rows}</table><h3>Признаки</h3><ul>{flags}</ul><h3>Заметки</h3><ul>{notes}</ul><h3>Ссылки для ручной проверки</h3><ul>{links}</ul></section>'
+    checked = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    findings = list(rep["findings"])
+    rows = "".join(f"<tr><th>{escape(str(label))}</th><td>{escape(str(value))}</td></tr>" for label, value in findings)
+    paginate = " data-paginate" if len(findings) > 10 else ""
+    data = f"<table class='data'{paginate}><tbody>{rows}</tbody></table>" if rows else "<p class='muted'>данных нет</p>"
+    ordered_flags = sorted(
+        ((points, reason) for points, reason in rep["flags"] if reason),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    flags = "".join(f"<li><span class='pts'>+{points}</span> {escape(str(reason))}</li>" for points, reason in ordered_flags)
+    flags = flags or "<li class='muted'>признаков не найдено</li>"
+    notes = "".join(f"<li>{escape(str(note))}</li>" for note in rep["notes"]) or "<li class='muted'>заметок нет</li>"
+    allowed = ("http://", "https://", "tg://")
+    links = "".join(
+        f"<a class='btn' href='{escape(url, quote=True)}' target='_blank' rel='noopener noreferrer'>{escape(str(name))}</a>"
+        for name, url in rep["links"]
+        if isinstance(url, str) and url.lower().startswith(allowed)
+    )
+    links = links or "<span class='muted'>ссылок нет</span>"
+    return (
+        "<section class='card'>"
+        "<div class='head'><div>"
+        f"<div class='kind'>{escape(str(rep['type']))}</div>"
+        f"<h2>{escape(str(rep['target']))}</h2>"
+        f"<div class='meta'>Проверено: {checked}</div>"
+        "</div>"
+        f"<span class='risk' style='background:{RISK_COLORS[level]}'>Риск: {escape(level)} ({score})</span>"
+        "</div>"
+        "<h3>Данные</h3>" + data +
+        "<h3>Признаки риска</h3><ul class='flags'>" + flags + "</ul>"
+        "<h3>Заметки</h3><ul class='notes'>" + notes + "</ul>"
+        "<h3>Ссылки для ручной проверки</h3><div class='links'>" + links + "</div>"
+        "</section>"
+    )
 
 
 def render_page(reports: list[dict]) -> str:
-    body = "".join(html_report(rep) for rep in reports)
-    return f"<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Watson report</title><style>body{{max-width:820px;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif}}.card{{border:1px solid #8884;border-radius:10px;padding:1rem 1.2rem;margin:1rem 0}}.risk{{display:inline-block;color:#fff;padding:.2rem .7rem;border-radius:6px}}table{{border-collapse:collapse;width:100%}}th{{text-align:left;width:34%;vertical-align:top;padding:.2rem}}td{{padding:.2rem;word-break:break-word}}</style></head><body><h1>Watson</h1><small>Сформирован {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}. Оценка эвристическая.</small>{body}</body></html>"
+    escape = html.escape
+    cards = "".join(f"<div class='cardwrap' id='t{index}'>{html_report(rep)}</div>" for index, rep in enumerate(reports))
+    summary = ""
+    if len(reports) > 1:
+        rows = []
+        for index, rep in enumerate(reports):
+            score, level = risk(rep)
+            rows.append(
+                f"<tr><td><a href='#t{index}'>{escape(str(rep['target']))}</a></td>"
+                f"<td><span class='pill' style='background:{RISK_COLORS[level]}'>{escape(level)}</span></td>"
+                f"<td class='num'>{score}</td></tr>"
+            )
+        paginate = " data-paginate" if len(rows) > 10 else ""
+        summary = (
+            "<section class='card'><h2>Сводка</h2>"
+            f"<p class='meta'>Целей: {len(rows)}. Отсортировано по риску.</p>"
+            f"<table class='summary'{paginate}><thead><tr><th>Цель</th><th>Риск</th><th class='num'>Баллы</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></section>"
+        )
+    stamp = escape(dt.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    return (
+        "<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Watson report</title><style>" + REPORT_CSS + "</style></head>"
+        "<body><div class='wrap'>"
+        "<header><h1>Watson</h1><p class='meta'>Сформирован " + stamp +
+        ". Оценка эвристическая, не доказательство.</p></header>"
+        + summary + cards +
+        "<footer class='footer'>Оценка эвристическая, не доказательство. Не публикуйте персональные данные без законного основания.</footer>"
+        "</div><script>" + TABLE_JS + "</script></body></html>"
+    )
 
 
 def save_pdf(page: str, path: str) -> None:
@@ -704,7 +1167,7 @@ def markdown_report(reports: list[dict]) -> str:
             lines.append("")
         if rep["flags"]:
             lines += ["### Признаки", ""]
-            lines += [f"- +{points}: {reason}" for points, reason in rep["flags"] if reason]
+            lines += [f"- +{points}: {reason}" for points, reason in sorted(rep["flags"], reverse=True) if reason]
             lines.append("")
         if rep["notes"]:
             lines += ["### Заметки", ""]
@@ -720,11 +1183,29 @@ def self_test() -> None:
     assert detect("+79991234567") == "phone"
     assert crypto_kind("0x0000000000000000000000000000000000000000") == "eth"
     assert "Примерная дата регистрации" in dict(scan_id("1973230366")["findings"])
+    assert breach_kind("person@example.org") == "email"
+    assert breach_kind("@some_user") == "username"
+    assert breach_kind("+79991234567") == "phone"
+    hostile = new_report("Тест", "<img src=x onerror=alert(1)>")
+    hostile["flags"].append((3, "<script>bad()</script>"))
+    hostile["flags"].append((9, "высший приоритет"))
+    hostile["notes"].append("<b>note</b>")
+    hostile["links"].append(("js", "javascript:alert(1)"))
+    card = html_report(hostile)
+    assert "<img src=x" not in card and "&lt;img src=x" in card
+    assert "<script>bad()</script>" not in card
+    assert "javascript:alert(1)" not in card
+    assert card.index("+9") < card.index("+3")
+    page = render_page([hostile, scan_id("1973230366")])
+    assert "prefers-color-scheme" in page
+    assert "break-inside:avoid" in page
+    assert "Сводка" in page
+    assert "data-paginate" in page
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Watson — OSINT-триаж по открытым источникам и собственным экспортам")
-    parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|id|phone|email|user|domain|crypto|export|evidence)")
+    parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|id|phone|email|user|domain|crypto|export|evidence|breach)")
     parser.add_argument("-f", "--file", help="файл целей, по одной в строке")
     parser.add_argument("--export", help="Telegram Desktop JSON-экспорт")
     parser.add_argument("--evidence", action="append", metavar="PATH", help="локальный JSON/CSV/TXT-материал расследования; можно указать несколько раз")
@@ -733,6 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deep", action="store_true", help="дополнительные данные Telegram через ваш Telethon-сеанс")
     parser.add_argument("--sherlock", action="store_true", help="проверить username через установленный Sherlock")
     parser.add_argument("--maigret", action="store_true", help="проверить username через установленный Maigret")
+    parser.add_argument("--no-breach", action="store_true", help="не проверять email/username по breach-источникам")
     parser.add_argument("--html", help="сохранить HTML")
     parser.add_argument("--pdf", help="сохранить PDF через weasyprint")
     parser.add_argument("--json", help="сохранить JSON")
@@ -768,7 +1250,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(targets) > 1:
             print(f"[{index}/{len(targets)}] {kind}: {target}", file=sys.stderr)
         try:
-            reports.append(run(kind, target, ns.deep, ns.sherlock, ns.maigret))
+            reports.append(run(kind, target, ns.deep, ns.sherlock, ns.maigret, not ns.no_breach))
         except (OSError, ValueError) as exc:
             print(f"ошибка {target}: {exc}", file=sys.stderr)
         if index < len(targets):

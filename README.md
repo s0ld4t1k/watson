@@ -1,48 +1,91 @@
 # Watson
 
-Watson — консольный Python-скрипт для осторожного OSINT-триажа по открытым источникам и собственным Telegram-экспортам.
+Консольный Python-скрипт для осторожного OSINT-триажа по открытым источникам и собственным Telegram-экспортам.
 
-Он помогает собрать наблюдаемые признаки по username, Telegram ID, телефону, домену и крипто-адресу. Результаты эвристические: совпадение ника, номера или профиля не доказывает личность и не является доказательством мошенничества.
+**Порядок: сверху — установка и как запустить, дальше — подробности по типам целей, в самом низу — ограничения, политика и назначение проекта.**
 
-## Требования
+| Что нужно | Раздел |
+|---|---|
+| Поставить и проверить | [Установка](#установка) |
+| Первый запуск | [Как пользоваться](#как-пользоваться) |
+| Telegram, телефон, email, домен, крипто | [Другие типы целей](#другие-типы-целей) |
+| Несколько целей / свои материалы | [Несколько целей из файла](#несколько-целей-из-файла) |
+| HTML, Markdown, JSON, CSV, PDF | [Форматы отчётов](#форматы-отчётов) |
+| Что нельзя и как это трактовать | [Ограничения и безопасность](#ограничения-и-безопасность) |
 
-- Python 3.10 или новее
-- Интернет для публичных проверок
-- Telegram Desktop JSON-экспорт для режима `--export`
+## Установка
 
-Скрипт использует стандартную библиотеку Python. Дополнительные пакеты нужны только для отдельных возможностей:
+Скрипт одиночный и использует только стандартную библиотеку Python:
 
 ```sh
-pip install phonenumbers  # расширенная проверка телефонов
-pip install telethon      # Telegram API через --deep
-pip install weasyprint    # необязательно, экспорт PDF
-pip install maigret       # необязательно, поиск username по множеству сайтов
-# Sherlock обычно ставится как пакет sherlock-project:
-pip install sherlock-project
+git clone <repo-url> && cd watson
+python3 watson.py --self-test   # должно вывести: ok
 ```
 
-## Быстрый старт
+Требования:
 
-Проверка username:
+- Python 3.10 или новее;
+- интернет для публичных проверок;
+- JSON-экспорт Telegram Desktop — только для режима `--export`.
+
+Необязательные пакеты нужны лишь для отдельных возможностей:
 
 ```sh
-python3 watson.py @some_user
+pip install phonenumbers        # расширенная проверка телефонов
+pip install telethon            # Telegram API через --deep
+pip install weasyprint          # экспорт в PDF
+pip install maigret             # поиск username по множеству сайтов
+pip install sherlock-project    # Sherlock
 ```
 
-Проверка Telegram ID:
+Ключи API тоже необязательны и нужны только для breach-проверок:
 
 ```sh
-python3 watson.py --id 1973230366
+export WATSON_HIBP_API_KEY=your_api_key   # https://haveibeenpwned.com/API/Key
+export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io
 ```
 
-Или в явном формате `тип цель`:
+## Как пользоваться
+
+Цель можно указать без типа — тип определяется автоматически. Либо задать его явно: `python3 watson.py <тип> <цель>`, где тип — `tg`, `id`, `phone`, `email`, `user`, `domain`, `crypto`, `export`, `evidence`, `breach`.
 
 ```sh
-python3 watson.py id 1973230366
-python3 watson.py tg @some_user
+python3 watson.py @some_user                     # Telegram username
+python3 watson.py https://t.me/some_user         # то же по ссылке
+python3 watson.py --id 1973230366                # Telegram ID
+python3 watson.py id 1973230366                  # то же явно
+python3 watson.py phone +79991234567             # телефон
+python3 watson.py person@example.org             # email (+ breach-статус)
+python3 watson.py domain example.com             # домен
+python3 watson.py user some_name                 # username на площадках
+python3 watson.py crypto 0x0000...0000           # крипто-адрес
+python3 watson.py breach some_username           # только breach-статус
 ```
 
 Для Telegram ID скрипт показывает грубый диапазон даты регистрации. Это оценка по калибровочным точкам, а не точная дата.
+
+Основные флаги:
+
+| Флаг | Что делает |
+|---|---|
+| `--html report.html` | сохранить HTML-отчёт |
+| `--pdf report.pdf` | сохранить PDF (нужен `weasyprint`) |
+| `--out report.md` | сохранить Markdown-отчёт |
+| `--json report.json` / `--csv report.csv` | выгрузка в JSON/CSV |
+| `-f targets.txt` | несколько целей, по одной в строке |
+| `--export result.json` | разобрать JSON-экспорт Telegram Desktop |
+| `--evidence case.json` | свои материалы расследования (можно несколько раз) |
+| `--deep` | расширенные данные Telegram через ваш сеанс |
+| `--sherlock` / `--maigret` | поиск username по внешним инструментам |
+| `--no-breach` | не проверять email/username по breach-источникам |
+| `--no-cache` | удалить HTTP-кэш перед запуском |
+| `--self-test` | встроенная проверка установки |
+
+Флаги можно сочетать:
+
+```sh
+python3 watson.py -f targets.txt --html report.html --out report.md
+```
 
 ## Telegram username и ID
 
@@ -119,7 +162,40 @@ python3 watson.py person@example.org
 python3 watson.py email person@example.org
 ```
 
-Watson сохраняет email как индикатор, показывает домен и добавляет ссылки для ручной проверки публичных совпадений. Он не запрашивает закрытые базы и не делает вывод о владельце по одному совпадению.
+Watson сохраняет email как индикатор, показывает домен и добавляет ссылки для ручной проверки публичных совпадений. Он не делает вывод о владельце по одному совпадению.
+
+Для email и username автоматически запрашивается breach-статус (см. ниже); отключается флагом `--no-breach`.
+
+### Breach-статус
+
+Watson умеет отвечать на вопрос «где и когда этот идентификатор уже попадал в публичные утечки» — названиями утечек, датами и перечнем утёкших категорий полей. **Сами значения полей (имена, адреса, пароли) не запрашиваются и не выводятся.**
+
+```sh
+python3 watson.py breach person@example.org
+python3 watson.py breach some_username
+python3 watson.py person@example.org            # breach-статус добавится автоматически
+python3 watson.py person@example.org --no-breach  # без breach-проверки
+```
+
+Источники:
+
+| Источник | Что нужно | Что возвращает |
+| --- | --- | --- |
+| LeakCheck Public | ключа нет | записи, названия утечек, даты, категории полей |
+| XposedOrNot | ключа нет, только email | список утечек, оценка риска, качество паролей |
+| HIBP | `WATSON_HIBP_API_KEY` | название утечки, дата, `DataClasses` |
+| LeakCheck Pro | `WATSON_LEAKCHECK_KEY` | то же, плюс phone/domain и info-stealer логи |
+
+```sh
+export WATSON_HIBP_API_KEY=your_api_key   # https://haveibeenpwned.com/API/Key
+export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io
+```
+
+Ограничения источников: бесплатные API не ищут по номеру телефона; у XposedOrNot лимит 25 запросов в час. При rate limit в отчёте появится заметка, а не ошибка. Совпадения по username показываются, но не входят в оценку риска — ник не уникален между сервисами, поэтому это слабая зацепка.
+
+Breach-статус даёт +1/+2 к оценке риска и никогда не является доказательством мошенничества: почти любой старый аккаунт встречается в утечках. Ценность в другом — проверке, не переиспользуются ли учётные данные, и в том, что инфраструктура подозреваемого сама по себе светится в публичных базах.
+
+**Watson не скачивает и не запрашивает сырые дампы утёкших баз и не работает с закрытыми базами «пробива».**
 
 ### Домен
 
@@ -128,7 +204,9 @@ python3 watson.py example.com
 python3 watson.py domain example.com
 ```
 
-Проверяются RDAP, DNS, дата регистрации домена и публичные сертификаты `crt.sh`.
+Проверяются RDAP, DNS, дата регистрации домена, публичные сертификаты `crt.sh`, threat-пульсы AlienVault OTX и публичные сканы urlscan.io. Ключи API не нужны.
+
+Если OTX помечает домен как whitelisted, упоминания в пульсах показываются, но не влияют на оценку риска — это снижает ложные срабатывания на крупных сервисах.
 
 ### Username на открытых площадках
 
@@ -192,7 +270,7 @@ python3 watson.py --file targets.txt
 python3 watson.py -f targets.txt --deep
 ```
 
-Поддерживаемые явные типы: `tg`, `id`, `phone`, `email`, `user`, `domain`, `crypto`, `export`, `evidence`.
+Поддерживаемые явные типы: `tg`, `id`, `phone`, `email`, `user`, `domain`, `crypto`, `export`, `evidence`, `breach`.
 
 ### Материалы расследования и корреляция
 
@@ -220,6 +298,17 @@ domain suspicious.example
 Это режим анализа уже доступного evidence. Он не выполняет взлом, обход авторизации, поиск по закрытым базам или самостоятельное получение новых приватных данных.
 
 ## Форматы отчётов
+
+HTML-отчёт — один самодостаточный файл без внешних скриптов и CDN. Структура карточки:
+
+1. **Шапка** — тип цели, сама цель, дата проверки, бейдж риска (зелёный / оранжевый / красный) с числом баллов.
+2. **Данные** — таблица «параметр → значение».
+3. **Признаки риска** — список вида `+3: VoIP-номер…`, отсортирован по баллам.
+4. **Заметки** — ограничения и оговорки, мелким серым.
+5. **Ссылки для ручной проверки** — кнопки, открываются в новой вкладке (`rel="noopener noreferrer"`).
+6. **Футер** — «Оценка эвристическая, не доказательство. Не публикуйте данные».
+
+Светлая и тёмная темы (`prefers-color-scheme`), адаптив под телефон. В пакетном режиме сверху сводная таблица «цель — риск — баллы», отсортированная по риску. Таблицы длиннее 10 строк получают поиск и пагинацию. При печати карточки не режутся (`break-inside: avoid`), кириллица поддерживается, цвета бейджей сохраняются.
 
 Можно сохранить один и тот же результат сразу в несколько форматов:
 
@@ -259,6 +348,10 @@ python3 watson.py --self-test
 ok
 ```
 
+---
+
+Дальше — справочная и служебная часть: калибровка оценок, ограничения, политика конфиденциальности и назначение проекта. Для повседневного использования достаточно разделов выше.
+
 ## Калибровка Telegram ID
 
 Оценка возраста ID использует встроенные точки. Их можно заменить локальным файлом `~/.watson_anchors.json`:
@@ -275,10 +368,12 @@ ok
 
 ## Ограничения и безопасность
 
-- Watson не использует утечки, закрытые базы и deanonymization.
+- Watson не скачивает и не запрашивает сырые дампы утечек, не работает с закрытыми базами «пробива» и не делает deanonymization.
+- Breach-статус (LeakCheck, XposedOrNot, HIBP) возвращает только названия утечек, даты и категории полей — не сами значения.
 - Открытые источники могут быть устаревшими или неполными.
 - Оператор телефона может измениться после переноса номера.
 - Баланс крипто-адреса не показывает владельца кошелька.
+- Нахождение идентификатора в утечке не является признаком мошенничества.
 - Не публикуйте отчёты с персональными данными без законного основания.
 - Уважайте правила Telegram, сайтов и применимое законодательство.
 
@@ -312,6 +407,8 @@ The **intent and source of the information matter**. A request is treated as fra
 5. protect potential victims or support an investigation.
 
 The project must not facilitate unauthorized access to private databases, leaked credentials, stolen personal information, doxxing, harassment, stalking, or obtaining restricted personal data.
+
+Breach-exposure checks (LeakCheck, XposedOrNot, HIBP) are explicitly **not** in that category: they query public breach-notification APIs and return only aggregate metadata — breach name, date, and the categories of fields involved. No credential values, passwords, or record contents are requested, cached, or printed. Raw dumps, closed "probiv" databases, and dark-web collections are never fetched.
 
 ### Handling ambiguous requests
 
