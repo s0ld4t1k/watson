@@ -2,8 +2,8 @@
 """Watson: evidence-first OSINT triage for scam reports.
 
 Public web checks and Telegram data visible to the authenticated user are
-summarised as leads, never as proof of identity. No leaked databases or
-private-data enrichment is used.
+summarised as leads, never as proof of identity. No private data is acquired;
+locally supplied investigation evidence may be processed and correlated.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import html
 import json
 import re
@@ -32,12 +33,18 @@ UA = {"User-Agent": "Watson-OSINT/1.0"}
 
 
 def new_report(kind: str, target: str) -> dict:
-    return {"type": kind, "target": target, "findings": [], "flags": [], "links": [], "notes": []}
+    return {"type": kind, "target": target, "findings": [], "flags": [], "links": [], "notes": [], "indicators": {}}
 
 
 def add(rep: dict, label: str, value) -> None:
     if value not in (None, "", [], {}):
         rep["findings"].append((label, str(value)))
+
+
+def remember(rep: dict, kind: str, values) -> None:
+    if isinstance(values, str):
+        values = [values]
+    rep["indicators"][kind] = sorted({str(value) for value in values if value})
 
 
 def flag(rep: dict, points: int, reason: str) -> None:
@@ -98,6 +105,8 @@ def fetch_json(url: str, **kwargs):
 PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)")
 URL_RE = re.compile(r"https?://[^\s<>]+|(?<!\w)t\.me/[A-Za-z0-9_/?=-]+", re.I)
 USERNAME_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]{4,}")
+EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])", re.I)
+ID_RE = re.compile(r"(?i)(?:telegram|user|account|клиент|аккаунт)?[_\s-]*id\s*[:#=]?\s*(-?\d{5,14})")
 SIGNALS = {
     "urgency": re.compile(r"срочно|немедленно|только сегодня|последн(?:ий|яя) шанс|urgent|now|limited time", re.I),
     "payment_request": re.compile(r"перевед|оплат|комисс|предоплат|карта|кошел[её]к|крипт|bitcoin|usdt|payment|send money", re.I),
@@ -135,7 +144,41 @@ def export_indicators(text: str) -> dict[str, list[str]]:
         "phones": sorted(set(PHONE_RE.findall(text))),
         "urls": sorted(set(URL_RE.findall(text))),
         "usernames": sorted(set(USERNAME_RE.findall(text))),
+        "emails": sorted(set(EMAIL_RE.findall(text))),
+        "ids": sorted(set(ID_RE.findall(text))),
     }
+
+
+def scan_evidence(target: str) -> dict:
+    path = Path(target).expanduser()
+    rep = new_report("Предоставленное доказательство", str(path))
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        rep["notes"].append(f"Не удалось прочитать материал: {exc}")
+        return rep
+    text = raw.decode("utf-8", "replace")
+    add(rep, "Размер файла", len(raw))
+    add(rep, "SHA-256", hashlib.sha256(raw).hexdigest())
+    add(rep, "Формат", path.suffix.lower().lstrip(".") or "текст")
+    if path.suffix.lower() == ".json":
+        try:
+            payload = json.loads(text)
+            add(rep, "JSON-записей", len(payload) if isinstance(payload, (list, dict)) else 0)
+        except json.JSONDecodeError:
+            rep["notes"].append("Файл имеет расширение JSON, но не распознан как корректный JSON.")
+    elif path.suffix.lower() == ".csv":
+        try:
+            add(rep, "CSV-строк", max(0, sum(1 for _ in csv.reader(text.splitlines())) - 1))
+        except csv.Error as exc:
+            rep["notes"].append(f"CSV не удалось разобрать: {exc}")
+    indicators = export_indicators(text)
+    rep["indicators"] = indicators
+    for name, values in indicators.items():
+        add(rep, f"Найденные {name}", ", ".join(values))
+    rep["notes"].append("Материал прочитан локально; Watson не получает по нему новые закрытые данные.")
+    rep["notes"].append("Совпадения являются следственными зацепками и требуют проверки источника и контекста.")
+    return rep
 
 
 def scan_export_from_messages(messages: list[dict]) -> dict:
@@ -145,6 +188,7 @@ def scan_export_from_messages(messages: list[dict]) -> dict:
         hits = [name for name, pattern in SIGNALS.items() if pattern.search(text)]
         if hits:
             flag(rep, min(30, 3 * len(hits)), f"Сообщение {message.get('id', '?')}: {', '.join(hits)}")
+    rep["indicators"] = export_indicators("\n".join(message_text(item.get("text")) for item in messages))
     return rep
 
 
@@ -166,7 +210,8 @@ def scan_export(target: str) -> dict:
         flag(rep, min(30, 3 * len(hits)), f"Сообщение {message.get('id', '?')}: {', '.join(hits)}")
     add(rep, "Сообщений проверено", len(messages))
     add(rep, "Сообщений с сигналами", len(matches))
-    for name, values in export_indicators(all_text).items():
+    rep["indicators"] = export_indicators(all_text)
+    for name, values in rep["indicators"].items():
         add(rep, f"Наблюдаемые {name}", ", ".join(values))
     for message_id, date, sender, hits, excerpt in matches:
         add(rep, f"Улика #{message_id}", f"{date} | {sender} | {hits} | {excerpt}")
@@ -191,6 +236,7 @@ def telegram_slug(target: str) -> str:
 def scan_telegram(target: str) -> dict:
     username = telegram_slug(target)
     rep = new_report("Telegram", "@" + username)
+    remember(rep, "usernames", username)
     status, body = fetch(f"https://t.me/{username}")
     if status != 200:
         rep["notes"].append(f"t.me вернул статус {status}; публичная страница недоступна.")
@@ -254,6 +300,7 @@ def scan_id(target: str) -> dict:
         rep["notes"].append("ID должен быть целым числом.")
         return rep
     rep = new_report("Telegram ID", value)
+    remember(rep, "ids", value)
     add(rep, "ID", uid)
     if uid > 0:
         estimate, newer = estimate_age(uid)
@@ -368,8 +415,20 @@ def scan_phone(target: str) -> dict:
         flag(rep, 3, "Платный номер")
     number_e164 = phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
     digits = number_e164.lstrip("+")
+    remember(rep, "phones", [target, number_e164, digits])
     rep["links"] += [("Google: номер + отзывы", f"https://www.google.com/search?q={quote(number_e164 + ' мошенник отзывы')}"), ("Яндекс: номер", f"https://yandex.ru/search/?text={quote(digits)}"), ("Telegram по номеру", f"https://t.me/+{digits}"), ("WhatsApp", f"https://wa.me/{digits}")]
     rep["notes"].append("По оператору и географии владельца установить нельзя; перенос номера может менять оператора.")
+    return rep
+
+
+def scan_email(target: str) -> dict:
+    address = target.strip()
+    rep = new_report("Email", address)
+    remember(rep, "emails", address)
+    domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
+    add(rep, "Домен", domain)
+    rep["links"].append(("Google: email", f"https://www.google.com/search?q={quote(chr(34) + address + chr(34))}"))
+    rep["notes"].append("Публичные совпадения email являются зацепками; утечки и закрытые базы Watson не запрашивает.")
     return rep
 
 
@@ -379,6 +438,7 @@ USER_SITES = {"GitHub": "https://github.com/{}", "GitLab": "https://gitlab.com/{
 def scan_username(target: str) -> dict:
     username = target.strip().lstrip("@")
     rep = new_report("Никнейм", username)
+    remember(rep, "usernames", username)
 
     def check(item):
         name, template = item
@@ -433,6 +493,7 @@ def run_username_tool(rep: dict, tool: str, target: str) -> None:
 def scan_domain(target: str) -> dict:
     domain = re.sub(r"^https?://", "", target.strip().lower()).split("/")[0].split(":")[0]
     rep = new_report("Домен", domain)
+    remember(rep, "domains", domain)
     status, data = fetch_json(f"https://rdap.org/domain/{domain}")
     if isinstance(data, dict):
         for event in data.get("events", []):
@@ -478,6 +539,7 @@ def scan_crypto(target: str) -> dict:
     address = target.strip()
     kind = crypto_kind(address)
     rep = new_report("Крипто-кошелёк", address)
+    remember(rep, "crypto", address)
     if not kind:
         rep["notes"].append("Формат не похож на BTC / ETH / TRON адрес.")
         return rep
@@ -515,6 +577,8 @@ def detect(value: str) -> str:
         return "tg"
     if crypto_kind(target):
         return "crypto"
+    if EMAIL_RE.fullmatch(target):
+        return "email"
     if re.fullmatch(r"\+?[\d\s\-()]{9,18}", target):
         return "phone"
     if re.search(r"^(https?://)?[\w.-]+\.[a-z]{2,}(/.*)?$", target, re.I):
@@ -522,7 +586,7 @@ def detect(value: str) -> str:
     return "user"
 
 
-SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export}
+SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export, "evidence": scan_evidence}
 
 
 def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maigret: bool = False) -> dict:
@@ -539,6 +603,28 @@ def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maig
             if maigret:
                 run_username_tool(rep, "Maigret", username)
     return rep
+
+
+def correlate_reports(reports: list[dict]) -> None:
+    matches = {}
+    for index, rep in enumerate(reports):
+        for kind, values in rep.get("indicators", {}).items():
+            for value in values:
+                normalized = str(value).strip()
+                if kind in ("usernames", "emails", "domains"):
+                    normalized = normalized.lower()
+                elif kind == "phones":
+                    normalized = re.sub(r"\D", "", normalized)
+                if kind == "usernames":
+                    normalized = normalized.lstrip("@")
+                matches.setdefault((kind, normalized), {})[index] = value
+    for (kind, normalized), occurrences in matches.items():
+        if len(occurrences) < 2 or not normalized:
+            continue
+        display = next(iter(occurrences.values()))
+        related = ", ".join(reports[index]["target"] for index in occurrences)
+        for index in occurrences:
+            add(reports[index], "Корреляция индикатора", f"{kind}: {display} → {related}")
 
 
 def read_targets(path: str) -> list[tuple[str, str]]:
@@ -638,9 +724,10 @@ def self_test() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Watson — OSINT-триаж по открытым источникам и собственным экспортам")
-    parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|phone|user|domain|crypto|export)")
+    parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|id|phone|email|user|domain|crypto|export|evidence)")
     parser.add_argument("-f", "--file", help="файл целей, по одной в строке")
     parser.add_argument("--export", help="Telegram Desktop JSON-экспорт")
+    parser.add_argument("--evidence", action="append", metavar="PATH", help="локальный JSON/CSV/TXT-материал расследования; можно указать несколько раз")
     parser.add_argument("--id", dest="telegram_id", help="проверить Telegram ID и оценить дату регистрации")
     parser.add_argument("--out", help="сохранить Markdown-отчёт")
     parser.add_argument("--deep", action="store_true", help="дополнительные данные Telegram через ваш Telethon-сеанс")
@@ -663,6 +750,8 @@ def main(argv: list[str] | None = None) -> int:
     targets = read_targets(ns.file) if ns.file else []
     if ns.export:
         targets.append(("export", ns.export))
+    for path in ns.evidence or []:
+        targets.append(("evidence", path))
     if ns.telegram_id:
         targets.append(("id", ns.telegram_id))
     if ns.args:
@@ -684,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ошибка {target}: {exc}", file=sys.stderr)
         if index < len(targets):
             time.sleep(2.0 if ns.deep else 0.5)
+    correlate_reports(reports)
     reports.sort(key=lambda rep: risk(rep)[0], reverse=True)
     for rep in reports:
         print_report(rep)
