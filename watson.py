@@ -244,6 +244,28 @@ def estimate_age(uid: int) -> tuple[str, bool]:
     return f"старше {anchors[0][1]}", False
 
 
+def scan_id(target: str) -> dict:
+    value = target.strip()
+    try:
+        uid = int(value)
+    except ValueError:
+        rep = new_report("Telegram ID", value)
+        rep["notes"].append("ID должен быть целым числом.")
+        return rep
+    rep = new_report("Telegram ID", value)
+    add(rep, "ID", uid)
+    if uid > 0:
+        estimate, newer = estimate_age(uid)
+        add(rep, "Примерная дата регистрации", estimate)
+        if newer:
+            flag(rep, 2, "ID выше последней калибровочной точки; аккаунт может быть свежим")
+    else:
+        add(rep, "Тип", "служебный ID группы/канала (эвристика)")
+    rep["links"].append(("Открыть Telegram", f"tg://openmessage?user_id={uid}"))
+    rep["notes"].append("Дата регистрации приблизительная: Telegram не предоставляет её напрямую по ID.")
+    return rep
+
+
 def telegram_status(status) -> str:
     return {"UserStatusOnline": "онлайн", "UserStatusRecently": "недавно (скрыто настройками)", "UserStatusLastWeek": "на этой неделе (скрыто)", "UserStatusLastMonth": "в этом месяце (скрыто)", "UserStatusOffline": "офлайн (время открыто)", "UserStatusEmpty": "давно или скрыто"}.get(type(status).__name__, "неизвестно")
 
@@ -266,7 +288,7 @@ def deep_telegram(rep: dict, username: str) -> None:
         return
     try:
         with TelegramClient(str(Path.home() / ".watson"), int(api_id), api_hash) as client:
-            entity = client.get_entity(username)
+            entity = client.get_entity(int(username) if re.fullmatch(r"-?\d+", username) else username)
             add(rep, "[API] ID", entity.id)
             if isinstance(entity, User):
                 estimate, newer = estimate_age(entity.id)
@@ -469,12 +491,12 @@ def detect(value: str) -> str:
     return "user"
 
 
-SCANNERS = {"tg": scan_telegram, "phone": scan_phone, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export}
+SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export}
 
 
 def run(kind: str, target: str, deep: bool = False) -> dict:
     rep = SCANNERS[kind](target)
-    if kind == "tg" and deep:
+    if kind in ("tg", "id") and deep:
         deep_telegram(rep, telegram_slug(target))
     return rep
 
@@ -571,6 +593,7 @@ def self_test() -> None:
     assert risk(rep)[0] == 6
     assert detect("+79991234567") == "phone"
     assert crypto_kind("0x0000000000000000000000000000000000000000") == "eth"
+    assert "Примерная дата регистрации" in dict(scan_id("1973230366")["findings"])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -578,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|phone|user|domain|crypto|export)")
     parser.add_argument("-f", "--file", help="файл целей, по одной в строке")
     parser.add_argument("--export", help="Telegram Desktop JSON-экспорт")
+    parser.add_argument("--id", dest="telegram_id", help="проверить Telegram ID и оценить дату регистрации")
     parser.add_argument("--out", help="сохранить Markdown-отчёт")
     parser.add_argument("--deep", action="store_true", help="дополнительные данные Telegram через ваш Telethon-сеанс")
     parser.add_argument("--html", help="сохранить HTML")
@@ -597,6 +621,8 @@ def main(argv: list[str] | None = None) -> int:
     targets = read_targets(ns.file) if ns.file else []
     if ns.export:
         targets.append(("export", ns.export))
+    if ns.telegram_id:
+        targets.append(("id", ns.telegram_id))
     if ns.args:
         if ns.args[0] in SCANNERS and len(ns.args) > 1:
             targets.append((ns.args[0], " ".join(ns.args[1:])))

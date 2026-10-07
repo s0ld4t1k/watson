@@ -1,16 +1,224 @@
 # Watson
 
-Объединённый скрипт для локального анализа Telegram-экспортов и проверки открытых индикаторов: username, телефон, домен и крипто-адрес.
+Watson — консольный Python-скрипт для осторожного OSINT-триажа по открытым источникам и собственным Telegram-экспортам.
+
+Он помогает собрать наблюдаемые признаки по username, Telegram ID, телефону, домену и крипто-адресу. Результаты эвристические: совпадение ника, номера или профиля не доказывает личность и не является доказательством мошенничества.
+
+## Требования
+
+- Python 3.10 или новее
+- Интернет для публичных проверок
+- Telegram Desktop JSON-экспорт для режима `--export`
+
+Скрипт использует стандартную библиотеку Python. Дополнительные пакеты нужны только для отдельных возможностей:
+
+```sh
+pip install phonenumbers  # расширенная проверка телефонов
+pip install telethon      # Telegram API через --deep
+pip install weasyprint    # необязательно, экспорт PDF
+```
+
+## Быстрый старт
+
+Проверка username:
+
+```sh
+python3 watson.py @some_user
+```
+
+Проверка Telegram ID:
+
+```sh
+python3 watson.py --id 1973230366
+```
+
+Или в явном формате `тип цель`:
+
+```sh
+python3 watson.py id 1973230366
+python3 watson.py tg @some_user
+```
+
+Для Telegram ID скрипт показывает грубый диапазон даты регистрации. Это оценка по калибровочным точкам, а не точная дата.
+
+## Telegram username и ID
+
+Обычная проверка username открывает публичную страницу Telegram и анализирует доступные название, описание, тип и ссылки:
+
+```sh
+python3 watson.py @some_user
+python3 watson.py https://t.me/some_user
+```
+
+Проверка ID без API:
+
+```sh
+python3 watson.py id 2110709080
+python3 watson.py --id 2110709080
+```
+
+Числовой ID лучше передавать как `id 2110709080` или через `--id`: неформатированный номер может быть распознан как телефон.
+
+### Расширенная Telegram-проверка
+
+`--deep` использует ваш Telegram-сеанс через Telethon и может получить доступные данные профиля: ID, имя, дополнительные username, bot/Premium/Verified, последний визит, bio, фото и общие группы.
+
+Сначала создайте API ID и API hash на [my.telegram.org](https://my.telegram.org), затем задайте переменные окружения:
+
+```sh
+export WATSON_TG_API_ID=123456
+export WATSON_TG_API_HASH=your_api_hash
+```
+
+Запуск:
+
+```sh
+python3 watson.py @some_user --deep
+python3 watson.py id 1973230366 --deep
+```
+
+При первом запуске Telethon попросит номер телефона, код Telegram и, если включён, пароль двухэтапной проверки. Локальная сессия сохраняется в `~/.watson.session`.
+
+`--deep` не обходит приватность Telegram: данные будут доступны только в пределах прав вашего аккаунта. Сырые ID иногда нельзя разрешить через API, если сущность не известна вашему сеансу.
+
+## Telegram JSON-экспорт
+
+Экспортируйте чат из Telegram Desktop в формате JSON и передайте его скрипту:
+
+```sh
+python3 watson.py --export /path/to/result.json
+```
+
+Скрипт проверяет текст сообщений на признаки:
+
+- срочность и давление;
+- просьбы об оплате, переводе или криптовалюте;
+- запросы паролей, SMS-кодов и seed-фраз;
+- выдачу себя за банк, поддержку, администратора или службу безопасности;
+- перевод общения в WhatsApp, Signal и другие сервисы.
+
+Также выводятся найденные телефоны, ссылки, usernames и короткие выдержки сообщений.
+
+## Другие типы целей
+
+### Телефон
+
+```sh
+python3 watson.py phone +79991234567
+```
+
+При установленном `phonenumbers` будут показаны формат, валидность, регион, оператор по префиксу, часовые пояса и тип линии.
+
+### Домен
+
+```sh
+python3 watson.py example.com
+python3 watson.py domain example.com
+```
+
+Проверяются RDAP, DNS, дата регистрации домена и публичные сертификаты `crt.sh`.
+
+### Username на открытых площадках
+
+```sh
+python3 watson.py user some_name
+```
+
+Проверяются открытые страницы GitHub, GitLab, Keybase, Medium, Dev.to, Pastebin, Replit, Behance, SoundCloud, Telegram, Habr и Pikabu.
+
+Совпадение username на разных сайтах не означает, что профили принадлежат одному человеку.
+
+### Крипто-адрес
+
+```sh
+python3 watson.py crypto 0x0000000000000000000000000000000000000000
+```
+
+Поддерживаются адреса Bitcoin, Ethereum/EVM и TRON. Для BTC и ETH скрипт дополнительно запрашивает баланс и число транзакций через Blockchair, для TRON — через Tronscan.
+
+## Несколько целей из файла
+
+Одна цель на строку:
+
+```text
+@some_user
+example.com
++79991234567
+crypto 0x0000000000000000000000000000000000000000
+id 1973230366
+export /path/to/result.json
+```
+
+Пустые строки и строки, начинающиеся с `#`, игнорируются.
+
+Запуск:
+
+```sh
+python3 watson.py --file targets.txt
+python3 watson.py -f targets.txt --deep
+```
+
+Поддерживаемые явные типы: `tg`, `id`, `phone`, `user`, `domain`, `crypto`, `export`.
+
+## Форматы отчётов
+
+Можно сохранить один и тот же результат сразу в несколько форматов:
+
+```sh
+python3 watson.py -f targets.txt \
+  --out report.md \
+  --html report.html \
+  --json report.json \
+  --csv report.csv
+```
+
+PDF создаётся через необязательный `weasyprint`:
+
+```sh
+python3 watson.py @some_user --html report.html --pdf report.pdf
+```
+
+Если `weasyprint` не установлен, откройте HTML в браузере и выберите печать в PDF.
+
+## Кэш и проверка установки
+
+HTTP-ответы кэшируются локально на 6 часов в `~/.watson_cache.sqlite`. Чтобы удалить кэш перед запуском:
+
+```sh
+python3 watson.py @some_user --no-cache
+```
+
+Встроенная проверка:
 
 ```sh
 python3 watson.py --self-test
-python3 watson.py --export /path/to/result.json --html report.html --csv report.csv
-python3 watson.py @some_user --deep
-python3 watson.py -f targets.txt --html all.html --csv all.csv
 ```
 
-Опционально: `pip install phonenumbers` для телефонов, `pip install telethon` для `--deep`, `pip install weasyprint` для PDF. Для `--deep` нужны `WATSON_TG_API_ID` и `WATSON_TG_API_HASH` с `my.telegram.org`; Telethon использует ваш аккаунт и сохранит локальную сессию.
+Успешный результат:
 
-Возраст Telegram по ID — грубая оценка. Якоря можно откалибровать в `~/.watson_anchors.json`.
+```text
+ok
+```
 
-Скрипт не использует утечки, закрытые базы или deanonymization. Все результаты эвристические: совпадение ника, телефона или открытого профиля не доказывает личность или мошенничество.
+## Калибровка Telegram ID
+
+Оценка возраста ID использует встроенные точки. Их можно заменить локальным файлом `~/.watson_anchors.json`:
+
+```json
+[
+  [2768409, "2013-11"],
+  [100000000, "2015-03"],
+  [500000000, "2018-01"]
+]
+```
+
+Каждая запись имеет формат `[минимальный_id, "YYYY-MM"]`. Это всё равно останется приблизительной оценкой.
+
+## Ограничения и безопасность
+
+- Watson не использует утечки, закрытые базы и deanonymization.
+- Открытые источники могут быть устаревшими или неполными.
+- Оператор телефона может измениться после переноса номера.
+- Баланс крипто-адреса не показывает владельца кошелька.
+- Не публикуйте отчёты с персональными данными без законного основания.
+- Уважайте правила Telegram, сайтов и применимое законодательство.
