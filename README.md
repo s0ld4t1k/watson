@@ -16,6 +16,9 @@ Watson — консольный Python-скрипт для осторожног�
 pip install phonenumbers  # расширенная проверка телефонов
 pip install telethon      # Telegram API через --deep
 pip install weasyprint    # необязательно, экспорт PDF
+pip install maigret       # необязательно, поиск username по множеству сайтов
+# Sherlock обычно ставится как пакет sherlock-project:
+pip install sherlock-project
 ```
 
 ## Быстрый старт
@@ -127,6 +130,28 @@ python3 watson.py user some_name
 Проверяются открытые страницы GitHub, GitLab, Keybase, Medium, Dev.to, Pastebin, Replit, Behance, SoundCloud, Telegram, Habr и Pikabu.
 
 Совпадение username на разных сайтах не означает, что профили принадлежат одному человеку.
+
+### Sherlock и Maigret
+
+Watson может добавить результаты уже установленных Sherlock и Maigret в тот же отчёт. Их базы и сетевые проверки остаются внутри этих инструментов; Watson только запускает CLI и собирает найденные ссылки.
+
+Проверить username обоими инструментами:
+
+```sh
+python3 watson.py @some_user --sherlock --maigret
+```
+
+Или запустить только один:
+
+```sh
+python3 watson.py @some_user --sherlock
+python3 watson.py @some_user --maigret
+python3 watson.py tg @some_user --deep --sherlock --maigret
+```
+
+Если команда не установлена, Watson не падает: в отчёте появится заметка с названием отсутствующего инструмента. Sherlock и Maigret работают с username; для числового Telegram ID сначала используйте `--deep`, чтобы получить доступный username, затем повторите поиск по нему.
+
+Обе проверки могут выполнять много HTTP-запросов и занимать несколько минут. Используйте их только для публичных, законных проверок и учитывайте возможные false positive.
 
 ### Крипто-адрес
 

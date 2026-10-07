@@ -16,6 +16,7 @@ import json
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -399,6 +400,36 @@ def scan_username(target: str) -> dict:
     return rep
 
 
+def run_username_tool(rep: dict, tool: str, target: str) -> None:
+    username = target.strip().lstrip("@")
+    commands = {
+        "Sherlock": ["sherlock", "--print-found", "--no-color", "--timeout", "15", username],
+        "Maigret": ["maigret", username],
+    }
+    try:
+        result = subprocess.run(commands[tool], capture_output=True, text=True, timeout=300, check=False)
+    except FileNotFoundError:
+        rep["notes"].append(f"{tool} не найден в PATH; установите его отдельно для этой проверки.")
+        return
+    except subprocess.TimeoutExpired:
+        rep["notes"].append(f"{tool} не завершился за 300 с.")
+        return
+    output = result.stdout + "\n" + result.stderr
+    urls = sorted({
+        url.rstrip(".,;")
+        for line in output.splitlines()
+        if "[+]" in line or "CLAIMED" in line.upper()
+        for url in re.findall(r"https?://[^\s<>\]\)]+", line)
+    })
+    if urls:
+        add(rep, f"{tool}: найдено профилей", len(urls))
+        rep["links"] += [(f"{tool}: найденный профиль", url) for url in urls]
+    else:
+        add(rep, f"{tool}: найдено профилей", "нет")
+    if result.returncode and result.stderr.strip():
+        rep["notes"].append(f"{tool}: {result.stderr.strip()[-500:]}")
+
+
 def scan_domain(target: str) -> dict:
     domain = re.sub(r"^https?://", "", target.strip().lower()).split("/")[0].split(":")[0]
     rep = new_report("Домен", domain)
@@ -494,10 +525,19 @@ def detect(value: str) -> str:
 SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export}
 
 
-def run(kind: str, target: str, deep: bool = False) -> dict:
+def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maigret: bool = False) -> dict:
     rep = SCANNERS[kind](target)
     if kind in ("tg", "id") and deep:
         deep_telegram(rep, telegram_slug(target))
+    if kind in ("tg", "user") and (sherlock or maigret):
+        username = telegram_slug(target) if kind == "tg" else target
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", username):
+            rep["notes"].append("Sherlock/Maigret требуют username, а не Telegram ID или ссылку.")
+        else:
+            if sherlock:
+                run_username_tool(rep, "Sherlock", username)
+            if maigret:
+                run_username_tool(rep, "Maigret", username)
     return rep
 
 
@@ -604,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--id", dest="telegram_id", help="проверить Telegram ID и оценить дату регистрации")
     parser.add_argument("--out", help="сохранить Markdown-отчёт")
     parser.add_argument("--deep", action="store_true", help="дополнительные данные Telegram через ваш Telethon-сеанс")
+    parser.add_argument("--sherlock", action="store_true", help="проверить username через установленный Sherlock")
+    parser.add_argument("--maigret", action="store_true", help="проверить username через установленный Maigret")
     parser.add_argument("--html", help="сохранить HTML")
     parser.add_argument("--pdf", help="сохранить PDF через weasyprint")
     parser.add_argument("--json", help="сохранить JSON")
@@ -637,7 +679,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(targets) > 1:
             print(f"[{index}/{len(targets)}] {kind}: {target}", file=sys.stderr)
         try:
-            reports.append(run(kind, target, ns.deep))
+            reports.append(run(kind, target, ns.deep, ns.sherlock, ns.maigret))
         except (OSError, ValueError) as exc:
             print(f"ошибка {target}: {exc}", file=sys.stderr)
         if index < len(targets):
