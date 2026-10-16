@@ -22,12 +22,19 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+try:
+    import curses
+except ImportError:  # платформы без curses (обычно Windows)
+    curses = None
 
 
 CACHE_DB = Path.home() / ".watson_cache.sqlite"
@@ -270,7 +277,7 @@ def scan_telegram(target: str) -> dict:
         if re.search(r"t\.me/\+|joinchat|bit\.ly|tinyurl", description, re.I):
             flag(rep, 1, "В bio есть ссылка-перенаправление")
     rep["notes"].append("Публичная страница не подтверждает принадлежность аккаунта конкретному человеку.")
-    rep["links"] += [("Профиль t.me", f"https://t.me/{username}"), ("Поиск ника в Google", f"https://www.google.com/search?q={quote(chr(34) + username + chr(34))}"), ("Поиск ника в Яндексе", f"https://yandex.ru/search/?text={quote(chr(34) + username + chr(34))}")]
+    rep["links"] += [("Профиль t.me", f"https://t.me/{username}"), ("Поиск ника в Google", f"https://www.google.com/search?q={quote(chr(34) + username + chr(34))}"), ("Поиск ника в Яндексе", f"https://yandex.ru/search/?text={quote(chr(34) + username + chr(34))}")] + username_dork_links(username)
     return rep
 
 
@@ -387,6 +394,91 @@ def deep_telegram(rep: dict, username: str) -> None:
         rep["notes"].append(f"[API] Ошибка: {exc}")
 
 
+def phone_social_links(digits: str, number_e164: str | None = None) -> list[tuple[str, str]]:
+    """Публичные ссылки для ручной OSINT-проверки номера (без обращения к закрытым базам)."""
+    e164 = number_e164 or ("+" + digits)
+    exact = quote(chr(34) + digits + chr(34))
+    return [
+        ("Google: номер + отзывы", f"https://www.google.com/search?q={quote(e164 + ' мошенник отзывы')}"),
+        ("Google: точное совпадение номера", f"https://www.google.com/search?q={exact}"),
+        ("Яндекс: номер", f"https://yandex.ru/search/?text={quote(digits)}"),
+        ("Google dork: VK / OK / Instagram", f"https://www.google.com/search?q={quote(chr(34) + digits + chr(34) + ' site:vk.com OR site:ok.ru OR site:instagram.com OR site:tiktok.com OR site:facebook.com OR site:avito.ru')}"),
+        ("Telegram по номеру", f"https://t.me/+{digits}"),
+        ("WhatsApp", f"https://wa.me/{digits}"),
+        ("Viber", f"viber://add?number={digits}"),
+        ("Truecaller: публичный поиск", f"https://www.truecaller.com/search/ru/{digits}"),
+        ("VK: поиск (через Google)", f"https://www.google.com/search?q={quote(chr(34) + digits + chr(34) + ' site:vk.com')}"),
+        ("OK.ru: поиск (через Google)", f"https://www.google.com/search?q={quote(chr(34) + digits + chr(34) + ' site:ok.ru')}"),
+        ("Avito: поиск (через Google)", f"https://www.google.com/search?q={quote(chr(34) + digits + chr(34) + ' site:avito.ru')}"),
+        ("DuckDuckGo: номер", f"https://duckduckgo.com/?q={quote(chr(34) + digits + chr(34))}"),
+    ]
+
+
+def email_social_links(address: str) -> list[tuple[str, str]]:
+    local, _, domain = address.partition("@")
+    gravatar = hashlib.md5(address.strip().lower().encode()).hexdigest()
+    exact = quote(chr(34) + address + chr(34))
+    return [
+        ("Google: точное совпадение email", f"https://www.google.com/search?q={exact}"),
+        ("Google: email + соцсети", f"https://www.google.com/search?q={quote(chr(34) + address + chr(34) + ' site:github.com OR site:gitlab.com OR site:linkedin.com OR site:x.com OR site:reddit.com OR site:telegram.org')}"),
+        ("Яндекс: email", f"https://yandex.ru/search/?text={quote(address)}"),
+        ("Gravatar: профиль по hash", f"https://www.gravatar.com/avatar/{gravatar}"),
+        ("Gravatar: публичный профиль", f"https://www.gravatar.com/{gravatar}"),
+        ("GitHub: поиск пользователя", f"https://github.com/search?q={quote(address)}&type=users"),
+        ("Hunter: домен", f"https://hunter.io/search/{domain}") if domain else ("Hunter", "https://hunter.io/"),
+    ]
+
+
+def username_dork_links(username: str) -> list[tuple[str, str]]:
+    exact = quote(chr(34) + username + chr(34))
+    return [
+        ("Google: точное совпадение ника", f"https://www.google.com/search?q={exact}"),
+        ("Google: ник + соцсети", f"https://www.google.com/search?q={quote(chr(34) + username + chr(34) + ' site:vk.com OR site:ok.ru OR site:instagram.com OR site:tiktok.com OR site:telegram.org')}"),
+        ("Яндекс: ник", f"https://yandex.ru/search/?text={quote(chr(34) + username + chr(34))}"),
+        ("Bing: ник", f"https://www.bing.com/search?q={exact}"),
+    ]
+
+
+def image_reverse_links(target: str) -> list[tuple[str, str]]:
+    value = target.strip()
+    links = []
+    if re.match(r"^https?://", value, re.I):
+        encoded = quote(value, safe="")
+        links.append(("Google Lens: изображение", f"https://lens.google.com/uploadbyurl?url={encoded}"))
+        links.append(("Yandex Images: обратный поиск", f"https://yandex.ru/images/search?rpt=imageview&url={encoded}"))
+        links.append(("TinEye: обратный поиск", f"https://tineye.com/search?url={encoded}"))
+    links.append(("Google Images", "https://images.google.com/"))
+    links.append(("Yandex Images", "https://yandex.ru/images/"))
+    links.append(("PimEyes: поиск лица", "https://pimeyes.com/en"))
+    links.append(("Social Catfish: обратный поиск фото", "https://socialcatfish.com/reverse-image-search/"))
+    return links
+
+
+def osint_pivot_links(kind: str, target: str, indicators: dict | None = None) -> list[tuple[str, str]]:
+    """Дополнительные ручные точки OSINT, как у ботов-агрегаторов открытых данных."""
+    result: list[tuple[str, str]] = []
+    if kind == "phone":
+        number = re.sub(r"\D", "", target)
+        result += phone_social_links(number)
+    elif kind in ("email", "Email"):
+        result += email_social_links(target)
+    elif kind in ("username", "Никнейм", "tg"):
+        slug = telegram_slug(target)
+        if slug:
+            result += username_dork_links(slug)
+    elif kind == "domain":
+        result += [
+            ("Google: домен + соцсети", f"https://www.google.com/search?q={quote(chr(34) + target + chr(34) + ' scam OR мошенник OR отзывы')}"),
+            ("Wayback Machine", f"https://web.archive.org/web/*/{target}"),
+        ]
+    elif kind in ("crypto", "Крипто-кошелёк"):
+        result += [
+            ("Breadcrumbs", f"https://breadcrumbs.app/"),
+            ("Chainabuse", f"https://www.chainabuse.com/address/{target}"),
+        ]
+    return result
+
+
 # Phone, username, domain, crypto --------------------------------------------
 def scan_phone(target: str) -> dict:
     rep = new_report("Телефон", target)
@@ -394,7 +486,12 @@ def scan_phone(target: str) -> dict:
         import phonenumbers
         from phonenumbers import PhoneNumberType as T, carrier, geocoder, timezone
     except ImportError:
+        digits = re.sub(r"\D", "", target)
+        if digits:
+            add(rep, "Цифры номера", digits)
+            rep["links"] += phone_social_links(digits)
         rep["notes"].append("Для разбора номеров установите: pip install phonenumbers")
+        rep["notes"].append("Без библиотеки доступна только базовая OSINT-навигация; формат, регион и оператор не определены.")
         return rep
     raw = re.sub(r"[^\d+]", "", target)
     if not raw.startswith("+"):
@@ -422,8 +519,9 @@ def scan_phone(target: str) -> dict:
     number_e164 = phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
     digits = number_e164.lstrip("+")
     remember(rep, "phones", [target, number_e164, digits])
-    rep["links"] += [("Google: номер + отзывы", f"https://www.google.com/search?q={quote(number_e164 + ' мошенник отзывы')}"), ("Яндекс: номер", f"https://yandex.ru/search/?text={quote(digits)}"), ("Telegram по номеру", f"https://t.me/+{digits}"), ("WhatsApp", f"https://wa.me/{digits}")]
+    rep["links"] += phone_social_links(digits, number_e164)
     rep["notes"].append("По оператору и географии владельца установить нельзя; перенос номера может менять оператора.")
+    rep["notes"].append("Связи номера с аккаунтами соцсетей являются зацепками; нужны независимая проверка и согласие на обработку персональных данных, если речь идёт о реальном человеке.")
     return rep
 
 
@@ -433,12 +531,36 @@ def scan_email(target: str) -> dict:
     remember(rep, "emails", address)
     domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
     add(rep, "Домен", domain)
-    rep["links"].append(("Google: email", f"https://www.google.com/search?q={quote(chr(34) + address + chr(34))}"))
+    rep["links"] += email_social_links(address)
     rep["notes"].append("Публичные совпадения email являются зацепками; сырые дампы и закрытые базы Watson не запрашивает.")
     return rep
 
 
-USER_SITES = {"GitHub": "https://github.com/{}", "GitLab": "https://gitlab.com/{}", "Keybase": "https://keybase.io/{}", "Medium": "https://medium.com/@{}", "Dev.to": "https://dev.to/{}", "Pastebin": "https://pastebin.com/u/{}", "Replit": "https://replit.com/@{}", "Behance": "https://www.behance.net/{}", "SoundCloud": "https://soundcloud.com/{}", "Telegram": "https://t.me/{}", "Habr": "https://habr.com/ru/users/{}/", "Pikabu": "https://pikabu.ru/@{}"}
+USER_SITES = {
+    "GitHub": "https://github.com/{}",
+    "GitLab": "https://gitlab.com/{}",
+    "Keybase": "https://keybase.io/{}",
+    "Medium": "https://medium.com/@{}",
+    "Dev.to": "https://dev.to/{}",
+    "Pastebin": "https://pastebin.com/u/{}",
+    "Replit": "https://replit.com/@{}",
+    "Behance": "https://www.behance.net/{}",
+    "SoundCloud": "https://soundcloud.com/{}",
+    "Telegram": "https://t.me/{}",
+    "Habr": "https://habr.com/ru/users/{}/",
+    "Pikabu": "https://pikabu.ru/@{}",
+    "Reddit": "https://www.reddit.com/user/{}/",
+    "X (Twitter)": "https://x.com/{}",
+    "Instagram": "https://www.instagram.com/{}/",
+    "Facebook": "https://www.facebook.com/{}",
+    "YouTube": "https://www.youtube.com/@{}",
+    "TikTok": "https://www.tiktok.com/@{}",
+    "LinkedIn": "https://www.linkedin.com/in/{}",
+    "VK": "https://vk.com/{}",
+    "Twitch": "https://www.twitch.tv/{}",
+    "Pinterest": "https://www.pinterest.com/{}/",
+    "Steam": "https://steamcommunity.com/id/{}",
+}
 
 
 def scan_username(target: str) -> dict:
@@ -460,6 +582,7 @@ def scan_username(target: str) -> dict:
     if unsure:
         add(rep, "Не удалось проверить", ", ".join(unsure))
     rep["links"] += found
+    rep["links"] += username_dork_links(username)
     rep["notes"].append("Совпадение ника не означает, что это один человек.")
     if not found:
         flag(rep, 1, "Ник не найден на проверенных открытых площадках")
@@ -598,6 +721,24 @@ def scan_crypto(target: str) -> dict:
     return rep
 
 
+def scan_image(target: str) -> dict:
+    value = target.strip()
+    rep = new_report("Изображение / обратный поиск лица", value)
+    local = Path(value).expanduser()
+    if local.exists() and local.is_file():
+        add(rep, "Локальный файл", local.name)
+        try:
+            add(rep, "Размер файла", local.stat().st_size)
+            add(rep, "SHA-256", hashlib.sha256(local.read_bytes()).hexdigest())
+        except (OSError, ValueError) as exc:
+            rep["notes"].append(f"Не удалось прочитать файл: {exc}")
+    rep["links"] += image_reverse_links(value)
+    rep["notes"].append("Watson не выполняет распознавание лиц локально; отчёты по фото проверяются вручную через обратный поиск и сервисы facial recognition.")
+    rep["notes"].append("Загрузка изображения в сторонние сервисы может раскрывать биометрические данные; делайте это только по законному основанию.")
+    remember(rep, "images", value)
+    return rep
+
+
 # Breach exposure status: names, dates and data classes only, never the values
 _BREACH_LAST: dict[str, float] = {}
 
@@ -641,14 +782,23 @@ def leakcheck_public(query: str) -> dict:
     return result
 
 
-def leakcheck_pro(query: str) -> dict:
+def leakcheck_pro(query: str, kind: str | None = None) -> dict:
+    if kind == "phone":
+        query = re.sub(r"\D", "", query)
     result = {"source": "LeakCheck Pro", "count": None, "breaches": [], "fields": [], "error": ""}
     key = os.getenv("WATSON_LEAKCHECK_KEY")
     if not key:
         return result
     throttle("leakcheck", 1.1)
+    query_url = f"https://leakcheck.io/api/v2/query/{quote(query)}?limit=100"
+    if kind in ("phone",):
+        query_url += "&type=phone"
+    elif kind in ("email",):
+        query_url += "&type=email"
+    elif kind in ("username",):
+        query_url += "&type=username"
     status, data = fetch_json(
-        f"https://leakcheck.io/api/v2/query/{quote(query)}?limit=100",
+        query_url,
         ttl=3600, timeout=20, headers={"X-API-Key": key, "Accept": "application/json"},
     )
     if status == 401:
@@ -757,7 +907,44 @@ def add_breach_signals(rep: dict, identifier: str) -> None:
         return
     kind = breach_kind(value)
     if kind == "phone":
-        rep["notes"].append("Breach-источники по номеру телефона недоступны в бесплатных API; используйте email или username.")
+        results = []
+        if os.getenv("WATSON_LEAKCHECK_KEY"):
+            results.append(leakcheck_pro(value, kind='phone'))
+        if not results:
+            rep["notes"].append("Бесплатные breach-источники по номеру телефона недоступны; при наличии WATSON_LEAKCHECK_KEY Watson проверит LeakCheck Pro (он поддерживает номер).")
+            return
+        # Handle only the collected phone results below instead of the usual email/username path.
+        total, consulted, classes = 0, [], set()
+        for item in results:
+            source = item["source"]
+            if item.get("error"):
+                rep["notes"].append(f"{source}: {item['error']}")
+                continue
+            count = item.get("count")
+            if count is None:
+                continue
+            consulted.append(source)
+            total = max(total, count)
+            add(rep, f"{source}: найдено записей", count)
+            if item.get("breaches"):
+                shown = item["breaches"][:20]
+                extra = len(item["breaches"]) - len(shown)
+                add(rep, f"{source}: источники (пример)", ", ".join(shown) + (f" и ещё {extra}" if extra > 0 else ""))
+            if item.get("fields"):
+                add(rep, f"{source}: категории данных", ", ".join(item["fields"]))
+            if item.get("quota") is not None:
+                add(rep, f"{source}: остаток запросов", item["quota"])
+            classes.update(str(field).lower() for field in item.get("fields") or [])
+        if consulted:
+            add(rep, "Проверено breach-источников", ", ".join(consulted))
+            rep["notes"].append("Возвращаются только названия утечек, даты и категории полей — не сами значения.")
+            if total == 0:
+                add(rep, "Найдено в утечках (телефон)", "нет")
+                return
+            rep["links"] += [("LeakCheck", "https://leakcheck.io/")]
+            flag(rep, 1, f"Номер телефона встречается в {total} записях публичных утечек")
+            if any("password" in field or "парол" in field for field in classes):
+                flag(rep, 1, "Среди утёкших категорий — пароли: возможно повторное использование учёток")
         return
     query = value.lstrip("@") if kind == "username" else value
     results = [leakcheck_public(query)]
@@ -766,7 +953,7 @@ def add_breach_signals(rep: dict, identifier: str) -> None:
         if os.getenv("WATSON_HIBP_API_KEY"):
             results.append(hibp_breaches(value))
     if os.getenv("WATSON_LEAKCHECK_KEY"):
-        results.append(leakcheck_pro(query))
+        results.append(leakcheck_pro(query, kind=kind if kind in ('email', 'username', 'phone') else None))
 
     total, consulted, classes = 0, [], set()
     for item in results:
@@ -837,12 +1024,16 @@ def detect(value: str) -> str:
         return "email"
     if re.fullmatch(r"\+?[\d\s\-()]{9,18}", target):
         return "phone"
+    if re.search(r"\.(png|jpe?g|gif|webp|bmp|tiff?)$", target, re.I):
+        return "image"
+    if re.search(r"^https?://.*\.(png|jpe?g|gif|webp|bmp|tiff?)(\?.*)?$", target, re.I):
+        return "image"
     if re.search(r"^(https?://)?[\w.-]+\.[a-z]{2,}(/.*)?$", target, re.I):
         return "domain"
     return "user"
 
 
-SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "export": scan_export, "evidence": scan_evidence, "breach": scan_breach}
+SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "image": scan_image, "export": scan_export, "evidence": scan_evidence, "breach": scan_breach}
 
 
 def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maigret: bool = False, breach: bool = True) -> dict:
@@ -899,20 +1090,25 @@ def read_targets(path: str) -> list[tuple[str, str]]:
     return targets
 
 
-def print_report(rep: dict) -> None:
+def format_report(rep: dict) -> str:
     score, level = risk(rep)
-    print(f"\n=== {rep['type']}: {rep['target']} ===")
+    lines = [f"=== {rep['type']}: {rep['target']} ==="]
     for label, value in rep["findings"]:
-        print(f"  {label}: {value}")
-    print(f"\n  Оценка риска: {level} ({score})")
+        lines.append(f"  {label}: {value}")
+    lines.append(f"\n  Оценка риска: {level} ({score})")
     for points, reason in rep["flags"]:
         if reason:
-            print(f"   [+{points}] {reason}")
+            lines.append(f"   [+{points}] {reason}")
     for note in rep["notes"]:
-        print(f"  * {note}")
+        lines.append(f"  * {note}")
     for name, url in rep["links"]:
-        print(f"  -> {name}: {url}")
-    print("\n  Оценка эвристическая. Не публикуйте персональные данные.")
+        lines.append(f"  -> {name}: {url}")
+    lines.append("\n  Оценка эвристическая. Не публикуйте персональные данные.")
+    return "\n".join(lines)
+
+
+def print_report(rep: dict) -> None:
+    print("\n" + format_report(rep))
 
 
 RISK_COLORS = {"низкий": "#2e7d32", "средний": "#ef6c00", "высокий": "#c62828"}
@@ -1176,6 +1372,860 @@ def markdown_report(reports: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def telegram_bot_api(token: str, method: str, params: dict | None = None, timeout: int = 25):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    if params:
+        query = "&".join(f"{quote(str(k), safe='')}={quote(str(v), safe='')}" for k, v in params.items())
+        url += "?" + query
+    status, data = fetch_json(url, ttl=0, timeout=timeout)
+    return status, data if isinstance(data, dict) else {}
+
+
+def send_telegram_message(token: str, chat_id, text: str) -> None:
+    limit = 3800
+    for chunk in [text[i:i + limit] for i in range(0, len(text), limit)] or [""]:
+        payload = json.dumps({"chat_id": chat_id, "text": chunk}, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=payload,
+            headers={**UA, "Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+        except Exception as exc:
+            print(f"Telegram send failed: {exc}", file=sys.stderr)
+            return
+        if not (isinstance(data, dict) and data.get("ok")):
+            print(f"Telegram send failed: {data}", file=sys.stderr)
+
+
+def bot_help_text() -> str:
+    return (
+        "Watson — OSINT-триаж. Отправьте цель одной строкой: @username, +7..., email, домен, адрес, /path/image.jpg или id 12345.\n"
+        "Команды: /help, /scan <цель>, /deep доступен только в CLI.\n"
+        "Оценка эвристическая, не доказательство."
+    )
+
+
+def bot_process_target(token: str, chat_id, text: str, deep: bool = False, sherlock: bool = False, maigret: bool = False, breach: bool = True) -> None:
+    line = text.strip()
+    if line.startswith("/scan "):
+        line = line[6:].strip()
+    if not line:
+        send_telegram_message(token, chat_id, bot_help_text())
+        return
+    try:
+        parts = line.split(None, 1)
+        kind, target = (parts[0], parts[1]) if parts[0] in SCANNERS and len(parts) > 1 else (detect(line), line)
+        report = run(kind, target, deep=deep, sherlock=sherlock, maigret=maigret, breach=breach)
+        send_telegram_message(token, chat_id, format_report(report))
+    except (OSError, ValueError) as exc:
+        send_telegram_message(token, chat_id, f"Ошибка: {exc}")
+
+
+def run_telegram_bot(token: str, deep: bool = False, sherlock: bool = False, maigret: bool = False, breach: bool = True, offset: int = 0) -> int:
+    print("Watson Telegram bot запущен. Ctrl+C для остановки.", file=sys.stderr)
+    try:
+        while True:
+            status, data = telegram_bot_api(token, "getUpdates", {"offset": offset, "timeout": 20}, timeout=30)
+            if not (isinstance(data, dict) and data.get("ok")):
+                print(f"getUpdates failed ({status}): {data}", file=sys.stderr)
+                time.sleep(3)
+                continue
+            for update in data.get("result", []) or []:
+                offset = int(update.get("update_id", 0)) + 1
+                message = update.get("message") or update.get("edited_message") or {}
+                chat = message.get("chat") or {}
+                chat_id = chat.get("id")
+                text = message.get("text") or ""
+                if chat_id is None or not text:
+                    continue
+                if text.startswith("/start") or text.startswith("/help"):
+                    send_telegram_message(token, chat_id, bot_help_text())
+                elif text.startswith("/scan") or not text.startswith("/"):
+                    bot_process_target(token, chat_id, text, deep=deep, sherlock=sherlock, maigret=maigret, breach=breach)
+                else:
+                    send_telegram_message(token, chat_id, "Неизвестная команда. Используйте /help.")
+    except KeyboardInterrupt:
+        print("\nWatson Telegram bot остановлен.", file=sys.stderr)
+        return 0
+    return 0
+
+
+# Interactive TUI ------------------------------------------------------------
+# Полноэкранный интерфейс на стандартном curses: без внешних зависимостей.
+
+KIND_INFO = [
+    ("tg", "Telegram-аккаунт", "@username, t.me/… или ссылка"),
+    ("id", "Telegram ID", "числовой ID, оценка даты регистрации"),
+    ("phone", "Телефон", "+7…, соцсети и мессенджеры"),
+    ("email", "Email", "адрес, домены, утечки"),
+    ("user", "Username", "ник для Sherlock / Maigret"),
+    ("domain", "Домен или сайт", "example.com"),
+    ("crypto", "Крипто-адрес", "BTC, ETH, USDT"),
+    ("image", "Изображение", "путь к файлу или URL"),
+    ("evidence", "Материалы дела", "локальный JSON/CSV/TXT"),
+    ("export", "Telegram-экспорт", "JSON из Telegram Desktop"),
+    ("breach", "Утечки", "email, username, телефон"),
+]
+
+TOGGLES = [
+    ("deep", "Глубокий Telegram (Telethon-сеанс)"),
+    ("sherlock", "Sherlock: поиск username по сайтам"),
+    ("maigret", "Maigret: расширенный поиск username"),
+    ("breach", "Проверка утечек (email / username / телефон)"),
+]
+
+SPINNER_UNICODE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_ASCII = "|/-\\"
+
+_ASCII_GLYPHS = {
+    "W": ["__        __", "\\ \\      / /", " \\ \\ /\\ / / ", "  \\ V  V /  ", "   \\_/\\_/   "],
+    "A": ["    _    ", "   / \\   ", "  / _ \\  ", " / ___ \\ ", "/_/   \\_\\"],
+    "T": [" _____ ", "|_   _|", "  | |  ", "  | |  ", "  |_|  "],
+    "S": [" ____  ", "/ ___| ", "\\___ \\ ", " ___) |", "|____/ "],
+    "O": ["  ___  ", " / _ \\ ", "| | | |", "| |_| |", " \\___/ "],
+    "N": [" _   _ ", "| \\ | |", "|  \\| |", "| |\\  |", "|_| \\_|"],
+}
+
+BANNER_UNICODE = [
+    "╦ ╦╔═╗╔╦╗╔═╗╔═╗╔╗╔",
+    "║║║╠═╣ ║ ╚═╗║╣ ║║║",
+    "╚╩╝╩ ╩ ╩ ╚═╝╚═╝╝╚╝",
+]
+
+
+def _ascii_banner(word: str = "WATSON") -> list[str]:
+    rows = ["" for _ in range(5)]
+    for index, letter in enumerate(word.upper()):
+        glyph = _ASCII_GLYPHS.get(letter, ["     "] * 5)
+        for row in range(5):
+            rows[row] += ("" if index == 0 else " ") + glyph[row]
+    return rows
+
+
+def _utf8_ok() -> bool:
+    encoding = (getattr(sys.stdout, "encoding", None) or "").lower()
+    try:
+        "╦═╗".encode(encoding or "ascii")
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+def _char_width(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _wcswidth(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
+def _clip(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    out, used = [], 0
+    for ch in text:
+        char_width = _char_width(ch)
+        if used + char_width > width:
+            break
+        out.append(ch)
+        used += char_width
+    return "".join(out)
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return [text]
+    lines = []
+    for raw in text.split("\n"):
+        if not raw:
+            lines.append("")
+            continue
+        current = ""
+        for word in raw.split(" "):
+            while _wcswidth(word) > width:
+                if current:
+                    lines.append(current)
+                    current = ""
+                chunk = _clip(word, width)
+                lines.append(chunk)
+                word = word[len(chunk):]
+            if not word:
+                continue
+            candidate = word if not current else current + " " + word
+            if _wcswidth(candidate) <= width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+    return lines
+
+
+def default_output_path(kind: str, target: str, ext: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{kind}_{target}").strip("_")[:60] or "report"
+    return str(Path.cwd() / f"watson_{safe}.{ext}")
+
+
+def write_report_file(rep: dict, fmt: str, path: str) -> str:
+    destination = Path(path).expanduser()
+    if fmt == "html":
+        destination.write_text(render_page([rep]), encoding="utf-8")
+    elif fmt == "json":
+        destination.write_text(json.dumps([rep], ensure_ascii=False, indent=2), encoding="utf-8")
+    elif fmt == "md":
+        destination.write_text(markdown_report([rep]), encoding="utf-8")
+    elif fmt == "csv":
+        score, level = risk(rep)
+        with destination.open("w", newline="", encoding="utf-8-sig") as output:
+            writer = csv.writer(output)
+            writer.writerow(["тип", "цель", "риск", "баллы", "признаки"])
+            writer.writerow([rep["type"], rep["target"], level, score, " | ".join(r for _, r in rep["flags"])])
+    else:
+        raise ValueError(f"неизвестный формат: {fmt}")
+    return str(destination)
+
+
+class _Quit(Exception):
+    pass
+
+
+class WatsonTUI:
+    def __init__(self, stdscr, options: dict):
+        self.scr = stdscr
+        self.opt = dict(options)
+        self.results: list[dict] = []
+        self.status = ""
+        self.screen = "home"
+        self.home_index = 0
+        self.kind_index = 0
+        self.opt_index = 0
+        self.list_index = 0
+        self.view_index = 0
+        self.save_index = 0
+        self.save_fmt = "html"
+        self.scroll = 0
+        self.max_scroll = 0
+        self.frame = 0
+        self.kind = "tg"
+        self.input = ""
+        self.input_pos = 0
+        self.running = False
+        self.scan_error = None
+        self.scan_result = None
+        self.toggle_mode = "run"
+        self.utf8 = True
+        self.banner: list[str] = []
+        self.spinner = SPINNER_ASCII
+        self.colors: dict[str, int] = {}
+
+    # -- инфраструктура -----------------------------------------------------
+    def setup(self) -> None:
+        self.utf8 = _utf8_ok()
+        self.banner = BANNER_UNICODE if self.utf8 else _ascii_banner("WATSON")
+        self.spinner = SPINNER_UNICODE if self.utf8 else SPINNER_ASCII
+        self.colors = {"dim": curses.A_DIM, "bold": curses.A_BOLD}
+        if curses.has_colors():
+            try:
+                curses.start_color()
+                try:
+                    curses.use_default_colors()
+                    background = -1
+                except curses.error:
+                    background = curses.COLOR_BLACK
+                palette = [
+                    ("accent", curses.COLOR_CYAN, True),
+                    ("low", curses.COLOR_GREEN, False),
+                    ("medium", curses.COLOR_YELLOW, False),
+                    ("high", curses.COLOR_RED, False),
+                    ("link", curses.COLOR_CYAN, False),
+                    ("section", curses.COLOR_MAGENTA, True),
+                ]
+                for pair, (name, foreground, bold) in enumerate(palette, start=1):
+                    try:
+                        curses.init_pair(pair, foreground, background)
+                        attr = curses.color_pair(pair)
+                        self.colors[name] = attr | (curses.A_BOLD if bold else 0)
+                    except curses.error:
+                        pass
+            except curses.error:
+                pass
+        try:
+            self.scr.keypad(True)
+        except curses.error:
+            pass
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        try:
+            curses.set_escdelay(25)
+        except (AttributeError, curses.error):
+            pass
+
+    def c(self, name: str) -> int:
+        return self.colors.get(name, 0)
+
+    def risk_attr(self, level: str) -> int:
+        return {"низкий": self.c("low"), "средний": self.c("medium"), "высокий": self.c("high")}.get(level, 0)
+
+    def dims(self):
+        return self.scr.getmaxyx()
+
+    def safe_add(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        height, width = self.dims()
+        if y < 0 or y >= height or x < 0 or x >= width:
+            return
+        try:
+            self.scr.addstr(y, x, _clip(text, width - x), attr)
+        except curses.error:
+            pass
+
+    def is_enter(self, key) -> bool:
+        return key in ("\n", "\r", curses.KEY_ENTER) or key == 10
+
+    def is_esc(self, key) -> bool:
+        return key == "\x1b" or key == 27
+
+    def is_backspace(self, key) -> bool:
+        return key in ("\x7f", "\b", curses.KEY_BACKSPACE) or key == 263
+
+    def edit_input(self, key) -> bool:
+        """Обрабатывает одну клавишу для однострочного ввода. True — обработано."""
+        if self.is_backspace(key):
+            if self.input_pos > 0:
+                self.input = self.input[: self.input_pos - 1] + self.input[self.input_pos:]
+                self.input_pos -= 1
+            return True
+        if key == curses.KEY_DC:
+            self.input = self.input[: self.input_pos] + self.input[self.input_pos + 1:]
+            return True
+        if key == curses.KEY_LEFT:
+            self.input_pos = max(0, self.input_pos - 1)
+            return True
+        if key == curses.KEY_RIGHT:
+            self.input_pos = min(len(self.input), self.input_pos + 1)
+            return True
+        if key == curses.KEY_HOME or key == "\x01":
+            self.input_pos = 0
+            return True
+        if key == curses.KEY_END or key == "\x05":
+            self.input_pos = len(self.input)
+            return True
+        if key == "\x15":
+            self.input = ""
+            self.input_pos = 0
+            return True
+        if isinstance(key, str) and len(key) == 1 and key.isprintable():
+            self.input = self.input[: self.input_pos] + key + self.input[self.input_pos:]
+            self.input_pos += 1
+            return True
+        return False
+
+    # -- главный цикл -------------------------------------------------------
+    def run(self) -> int:
+        self.setup()
+        while True:
+            self.draw()
+            self.scr.timeout(160 if self.screen == "run" else -1)
+            try:
+                key = self.scr.get_wch()
+            except curses.error:
+                key = None
+            except KeyboardInterrupt:
+                break
+            if key == curses.KEY_RESIZE:
+                continue
+            if key is None:
+                if self.screen == "run" and not self.running:
+                    self.finish_scan()
+                self.frame += 1
+                continue
+            handler = getattr(self, "_key_" + self.screen, None)
+            try:
+                if handler and handler(key) == "quit":
+                    break
+            except _Quit:
+                break
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        return 0
+
+    # -- рисование ----------------------------------------------------------
+    def draw(self) -> None:
+        self.scr.erase()
+        top = self.draw_header()
+        drawer = getattr(self, "_draw_" + self.screen, None)
+        if drawer:
+            drawer(top)
+        self.draw_status()
+        self.draw_footer()
+        visible = self.screen in ("target", "savepath")
+        try:
+            curses.curs_set(1 if visible else 0)
+        except curses.error:
+            pass
+        self.scr.refresh()
+
+    def draw_header(self) -> int:
+        height, width = self.dims()
+        y = 0
+        if height >= 17:
+            y = 1
+            for offset, line in enumerate(self.banner):
+                x = max(0, (width - _wcswidth(line)) // 2)
+                self.safe_add(y + offset, x, line, self.c("accent"))
+            y += len(self.banner) + 1
+        else:
+            title = "W A T S O N"
+            self.safe_add(y, max(0, (width - len(title)) // 2), title, self.c("accent"))
+            y += 2
+        separator = "─" * width if self.utf8 else "-" * width
+        self.safe_add(y, 0, separator, self.c("dim"))
+        return y + 1
+
+    def draw_footer(self, text: str = "") -> None:
+        height, width = self.dims()
+        self.safe_add(height - 1, 0, " " * width, curses.A_REVERSE)
+        self.safe_add(height - 1, 0, " " + _clip(text, width - 2), curses.A_REVERSE)
+
+    def draw_status(self) -> None:
+        height, width = self.dims()
+        if self.status:
+            self.safe_add(height - 2, 0, " " * width)
+            self.safe_add(height - 2, 0, "  " + _clip(self.status, width - 3), self.c("dim"))
+
+    def menu(self, y: int, items: list[str], index: int, indent: int = 2) -> int:
+        height, width = self.dims()
+        bottom = height - 3
+        rows = max(1, bottom - y + 1)
+        offset = 0
+        if index >= rows:
+            offset = index - rows + 1
+        marker = "❯ " if self.utf8 else "> "
+        for i in range(offset, min(len(items), offset + rows)):
+            selected = i == index
+            label = (marker if selected else "  ") + items[i]
+            attr = curses.A_REVERSE if selected else 0
+            self.safe_add(y + (i - offset), indent, _clip(label, width - indent - 1), attr)
+        return offset
+
+    # -- экраны: отрисовка --------------------------------------------------
+    def home_items(self) -> list[tuple[str, str]]:
+        items = [("new", "Новая проверка")]
+        if self.results:
+            items.append(("results", f"Результаты ({len(self.results)})"))
+        items += [("settings", "Настройки"), ("help", "Справка"), ("quit", "Выход")]
+        return items
+
+    def _draw_home(self, top: int) -> None:
+        items = self.home_items()
+        self.menu(top, [label for _, label in items], self.home_index)
+        self.draw_footer("↑/↓ выбрать · Enter открыть · q выход")
+
+    def _draw_kind(self, top: int) -> None:
+        self.safe_add(top, 2, "Выберите тип проверки", self.c("section"))
+        labels = [f"{title:<22} {hint}" for _, title, hint in KIND_INFO]
+        self.menu(top + 2, labels, self.kind_index)
+        self.draw_footer("↑/↓ выбрать · Enter далее · Esc назад")
+
+    def _draw_target(self, top: int) -> None:
+        width = self.dims()[1]
+        title, hint = next((t, h) for k, t, h in KIND_INFO if k == self.kind)
+        self.safe_add(top, 2, f"Тип: {title}", self.c("section"))
+        self.safe_add(top + 1, 2, hint, self.c("dim"))
+        label = "Цель:"
+        y = top + 3
+        self.safe_add(y, 2, label, self.c("bold"))
+        x = 2 + len(label) + 1
+        avail = max(1, width - x - 2)
+        self.safe_add(y, x, " " * (width - x))
+        start = 0
+        while start < self.input_pos and _wcswidth(self.input[start : self.input_pos]) > avail - 1:
+            start += 1
+        self.safe_add(y, x, _clip(self.input[start:], avail), self.c("accent"))
+        cursor_x = x + _wcswidth(self.input[start : self.input_pos])
+        try:
+            self.scr.move(y, min(cursor_x, width - 2))
+        except curses.error:
+            pass
+        self.draw_footer("Enter — далее · Esc — назад · Ctrl+U — очистить")
+
+    def _draw_options(self, top: int) -> None:
+        heading = "Параметры проверки" if self.toggle_mode == "run" else "Настройки проверок"
+        self.safe_add(top, 2, heading, self.c("section"))
+        if self.toggle_mode == "run":
+            title = next((t for k, t, _ in KIND_INFO if k == self.kind), self.kind)
+            self.safe_add(top + 1, 2, f"{title}: {self.target}", self.c("dim"))
+        labels = []
+        for name, description in TOGGLES:
+            box = "[x]" if self.opt.get(name) else "[ ]"
+            labels.append(f"{box} {description}")
+        labels.append("▶ Запустить проверку" if self.toggle_mode == "run" else "Готово")
+        self.menu(top + 3, labels, self.opt_index)
+        footer = "↑/↓ выбрать · Пробел/Enter — переключить · r — запустить · Esc назад"
+        if self.toggle_mode != "run":
+            footer = "↑/↓ выбрать · Пробел/Enter — переключить · Esc — сохранить"
+        self.draw_footer(footer)
+
+    def _draw_run(self, top: int) -> None:
+        width = self.dims()[1]
+        spin = self.spinner[self.frame % len(self.spinner)]
+        title = next((t for k, t, _ in KIND_INFO if k == self.kind), self.kind)
+        center_y = max(top + 1, self.dims()[0] // 2 - 1)
+        line = f"{spin}  Выполняется: {title}"
+        self.safe_add(center_y, max(0, (width - _wcswidth(line)) // 2), line, self.c("accent"))
+        target_line = _clip(self.target, width - 4)
+        self.safe_add(center_y + 1, max(0, (width - _wcswidth(target_line)) // 2), target_line, self.c("dim"))
+        self.draw_footer("Идёт сбор данных из открытых источников…")
+
+    def report_lines(self, rep: dict, width: int) -> list[tuple[str, int]]:
+        score, level = risk(rep)
+        out: list[tuple[str, int]] = []
+
+        def add(text: str, attr: int = 0) -> None:
+            for line in _wrap(text, width) or [""]:
+                out.append((line, attr))
+
+        add(f"{rep['type'].upper()} · {rep['target']}", self.c("accent") | curses.A_BOLD)
+        add(f"Оценка риска: {level} ({score})", self.risk_attr(level) | curses.A_BOLD)
+        add("")
+        add("ДАННЫЕ", self.c("section") | curses.A_BOLD)
+        if rep["findings"]:
+            for label, value in rep["findings"]:
+                add(f"  • {label}: {value}")
+        else:
+            add("  нет данных", self.c("dim"))
+        add("")
+        add("ПРИЗНАКИ РИСКА", self.c("section") | curses.A_BOLD)
+        notable = sorted((item for item in rep["flags"] if item[1]), key=lambda item: item[0], reverse=True)
+        if notable:
+            for points, reason in notable:
+                add(f"  +{points}  {reason}", self.c("high"))
+        else:
+            add("  признаков не найдено", self.c("dim"))
+        if rep["notes"]:
+            add("")
+            add("ЗАМЕТКИ", self.c("section") | curses.A_BOLD)
+            for note in rep["notes"]:
+                add(f"  * {note}", self.c("dim"))
+        if rep["links"]:
+            add("")
+            add("ССЫЛКИ ДЛЯ ПРОВЕРКИ", self.c("section") | curses.A_BOLD)
+            for name, url in rep["links"]:
+                add(f"  → {name}: {url}", self.c("link"))
+        add("")
+        add("Оценка эвристическая, не доказательство.", self.c("dim"))
+        return out
+
+    def _draw_result(self, top: int) -> None:
+        height, width = self.dims()
+        rep = self.results[self.view_index]
+        lines = self.report_lines(rep, width - 6)
+        bottom = height - 3
+        rows = max(1, bottom - top + 1)
+        self.max_scroll = max(0, len(lines) - rows)
+        self.scroll = max(0, min(self.scroll, self.max_scroll))
+        for i in range(self.scroll, min(len(lines), self.scroll + rows)):
+            text, attr = lines[i]
+            self.safe_add(top + (i - self.scroll), 3, text, attr)
+        position = ""
+        if self.max_scroll:
+            position = f"  [{self.scroll + 1}-{min(len(lines), self.scroll + rows)}/{len(lines)}]"
+        self.draw_footer("↑/↓ прокрутка · s сохранить · r повторить · Esc назад" + position)
+
+    def _draw_results(self, top: int) -> None:
+        self.safe_add(top, 2, "Сохранённые результаты (текущий сеанс)", self.c("section"))
+        items = []
+        for rep in self.results:
+            _, level = risk(rep)
+            items.append(f"{level:<7} · {rep['type']}: {rep['target']}")
+        self.menu(top + 2, items, self.list_index)
+        self.draw_footer("↑/↓ выбрать · Enter открыть · Esc назад")
+
+    def _draw_save(self, top: int) -> None:
+        self.safe_add(top, 2, "Сохранить отчёт в файл", self.c("section"))
+        items = [
+            "HTML — оформленный отчёт (открывается в браузере)",
+            "JSON — машинно-читаемые данные",
+            "CSV  — сводная таблица",
+            "Markdown — текстовый отчёт",
+        ]
+        self.menu(top + 2, items, self.save_index)
+        self.draw_footer("↑/↓ выбрать формат · Enter далее · Esc назад")
+
+    def _draw_savepath(self, top: int) -> None:
+        width = self.dims()[1]
+        self.safe_add(top, 2, "Путь для сохранения (Enter — записать файл)", self.c("section"))
+        label = "Файл:"
+        y = top + 2
+        self.safe_add(y, 2, label, self.c("bold"))
+        x = 2 + len(label) + 1
+        avail = max(1, width - x - 2)
+        self.safe_add(y, x, " " * (width - x))
+        start = 0
+        while start < self.input_pos and _wcswidth(self.input[start : self.input_pos]) > avail - 1:
+            start += 1
+        self.safe_add(y, x, _clip(self.input[start:], avail), self.c("accent"))
+        cursor_x = x + _wcswidth(self.input[start : self.input_pos])
+        try:
+            self.scr.move(y, min(cursor_x, width - 2))
+        except curses.error:
+            pass
+        self.draw_footer("Enter — сохранить · Esc — назад · Ctrl+U — очистить")
+
+    def _draw_help(self, top: int) -> None:
+        width = self.dims()[1]
+        sections = [
+            ("Навигация", [
+                "↑ / ↓  — перемещение по меню и прокрутка",
+                "Enter  — открыть / подтвердить",
+                "Esc / q — назад, из главного меню — выход",
+            ]),
+            ("Типы проверок", [
+                f"{title} — {hint}" for _, title, hint in KIND_INFO
+            ]),
+            ("Параметры", [
+                "Глубокий Telegram требует установленного Telethon-сеанса.",
+                "Sherlock / Maigret запускаются, только если установлены.",
+                "Проверка утечек показывает статус, имена, даты и классы данных.",
+            ]),
+            ("О выводах", [
+                "Все оценки эвристические и не являются доказательством.",
+                "Не публикуйте персональные данные без законного основания.",
+            ]),
+            ("Экспорт", [
+                "Из результата: s — сохранить HTML / JSON / CSV / Markdown.",
+            ]),
+        ]
+        y = top
+        bottom = self.dims()[0] - 3
+        for heading, lines in sections:
+            if y > bottom:
+                break
+            self.safe_add(y, 2, heading, self.c("section") | curses.A_BOLD)
+            y += 1
+            for line in lines:
+                for wrapped in _wrap("  " + line, width - 4):
+                    if y > bottom:
+                        break
+                    self.safe_add(y, 2, wrapped, self.c("dim"))
+                    y += 1
+            y += 1
+        self.draw_footer("↑/↓ прокрутка · Esc / q — назад")
+
+    # -- экраны: обработка клавиш ------------------------------------------
+    def _key_home(self, key):
+        items = self.home_items()
+        if key in (curses.KEY_UP, "k"):
+            self.home_index = (self.home_index - 1) % len(items)
+        elif key in (curses.KEY_DOWN, "j"):
+            self.home_index = (self.home_index + 1) % len(items)
+        elif key == "q" or self.is_esc(key):
+            raise _Quit
+        elif self.is_enter(key):
+            choice = items[self.home_index][0]
+            if choice == "new":
+                self.screen, self.kind_index, self.status = "kind", 0, ""
+            elif choice == "results":
+                self.screen, self.list_index, self.status = "results", 0, ""
+            elif choice == "settings":
+                self.toggle_mode, self.opt_index, self.screen = "settings", 0, "options"
+            elif choice == "help":
+                self.screen, self.status = "help", ""
+            elif choice == "quit":
+                raise _Quit
+        return None
+
+    def _key_kind(self, key):
+        count = len(KIND_INFO)
+        if self.is_esc(key) or key == "q":
+            self.screen = "home"
+        elif key in (curses.KEY_UP, "k"):
+            self.kind_index = (self.kind_index - 1) % count
+        elif key in (curses.KEY_DOWN, "j"):
+            self.kind_index = (self.kind_index + 1) % count
+        elif self.is_enter(key):
+            self.kind = KIND_INFO[self.kind_index][0]
+            self.input, self.input_pos, self.status = "", 0, ""
+            self.screen = "target"
+        return None
+
+    def _key_target(self, key):
+        if self.is_esc(key):
+            self.screen = "kind"
+        elif self.is_enter(key):
+            if self.input.strip():
+                self.target = self.input.strip()
+                self.toggle_mode, self.opt_index, self.screen = "run", 0, "options"
+            else:
+                self.status = "Сначала введите цель"
+        else:
+            self.edit_input(key)
+        return None
+
+    def _key_options(self, key):
+        count = len(TOGGLES) + 1
+        if key in (curses.KEY_UP, "k"):
+            self.opt_index = (self.opt_index - 1) % count
+        elif key in (curses.KEY_DOWN, "j"):
+            self.opt_index = (self.opt_index + 1) % count
+        elif key == " ":
+            if self.opt_index < len(TOGGLES):
+                name = TOGGLES[self.opt_index][0]
+                self.opt[name] = not self.opt.get(name)
+        elif key == "r" and self.toggle_mode == "run":
+            self.start_scan()
+        elif self.is_enter(key):
+            if self.opt_index < len(TOGGLES):
+                name = TOGGLES[self.opt_index][0]
+                self.opt[name] = not self.opt.get(name)
+            elif self.toggle_mode == "run":
+                self.start_scan()
+            else:
+                self.screen = "home"
+        elif self.is_esc(key) or key == "q":
+            self.screen = "target" if self.toggle_mode == "run" else "home"
+            self.status = ""
+        return None
+
+    def _key_run(self, key):
+        if key is None:
+            return None
+        if not self.running:
+            self.finish_scan()
+        return None
+
+    def _key_result(self, key):
+        page = max(1, self.dims()[0] - 8)
+        if key in (curses.KEY_UP, "k"):
+            self.scroll -= 1
+        elif key in (curses.KEY_DOWN, "j"):
+            self.scroll += 1
+        elif key == curses.KEY_PPAGE:
+            self.scroll -= page
+        elif key == curses.KEY_NPAGE:
+            self.scroll += page
+        elif key == curses.KEY_HOME:
+            self.scroll = 0
+        elif key == curses.KEY_END:
+            self.scroll = self.max_scroll
+        elif key == "s":
+            self.screen, self.save_index = "save", 0
+        elif key == "r":
+            self.start_scan()
+        elif self.is_esc(key) or key == "q":
+            self.screen, self.status = "home", ""
+        return None
+
+    def _key_results(self, key):
+        count = len(self.results)
+        if key in (curses.KEY_UP, "k"):
+            self.list_index = (self.list_index - 1) % count
+        elif key in (curses.KEY_DOWN, "j"):
+            self.list_index = (self.list_index + 1) % count
+        elif self.is_enter(key):
+            self.view_index, self.scroll, self.screen = self.list_index, 0, "result"
+        elif self.is_esc(key) or key == "q":
+            self.screen = "home"
+        return None
+
+    def _key_save(self, key):
+        if key in (curses.KEY_UP, "k"):
+            self.save_index = (self.save_index - 1) % 4
+        elif key in (curses.KEY_DOWN, "j"):
+            self.save_index = (self.save_index + 1) % 4
+        elif self.is_enter(key):
+            self.save_fmt = ["html", "json", "csv", "md"][self.save_index]
+            rep = self.results[self.view_index]
+            self.input = default_output_path(rep["type"], rep["target"], self.save_fmt)
+            self.input_pos = len(self.input)
+            self.screen = "savepath"
+        elif self.is_esc(key) or key == "q":
+            self.screen = "result"
+        return None
+
+    def _key_savepath(self, key):
+        if self.is_esc(key):
+            self.screen = "save"
+        elif self.is_enter(key):
+            rep = self.results[self.view_index]
+            try:
+                path = write_report_file(rep, self.save_fmt, self.input.strip())
+                self.status = f"Сохранено: {path}"
+                self.screen = "result"
+            except (OSError, ValueError) as exc:
+                self.status = f"Ошибка сохранения: {exc}"
+        else:
+            self.edit_input(key)
+        return None
+
+    def _key_help(self, key):
+        if self.is_esc(key) or key == "q" or self.is_enter(key):
+            self.screen = "home"
+        return None
+
+    # -- запуск проверки ----------------------------------------------------
+    def start_scan(self) -> None:
+        if self.running:
+            return
+        self.status = ""
+        self.scan_error = None
+        self.scan_result = None
+        self.running = True
+        self.frame = 0
+        self.screen = "run"
+        options = dict(self.opt)
+
+        def worker() -> None:
+            try:
+                self.scan_result = run(
+                    self.kind,
+                    self.target,
+                    deep=options.get("deep", False),
+                    sherlock=options.get("sherlock", False),
+                    maigret=options.get("maigret", False),
+                    breach=options.get("breach", True),
+                )
+            except Exception as exc:  # noqa: BLE001 — показываем ошибку в TUI
+                self.scan_error = str(exc)
+            finally:
+                self.running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_scan(self) -> None:
+        if self.scan_error is not None:
+            self.status = f"Ошибка: {self.scan_error}"
+            self.toggle_mode, self.opt_index, self.screen = "run", 0, "options"
+            self.scan_error = None
+            return
+        if self.scan_result is not None:
+            self.results.append(self.scan_result)
+            self.view_index = len(self.results) - 1
+            self.scroll = 0
+            self.screen = "result"
+            self.status = "Готово. s — сохранить, r — повторить."
+        self.scan_result = None
+
+
+def run_tui(options: dict) -> int:
+    if curses is None:
+        print("Интерактивный режим недоступен: модуль curses не найден.", file=sys.stderr)
+        return 2
+
+    def _main(stdscr):
+        return WatsonTUI(stdscr, options).run()
+
+    return curses.wrapper(_main)
+
+
 def self_test() -> None:
     messages = [{"id": 1, "text": "Срочно оплатите комиссию: https://example.test @helper"}]
     rep = scan_export_from_messages(messages)
@@ -1201,6 +2251,14 @@ def self_test() -> None:
     assert "break-inside:avoid" in page
     assert "Сводка" in page
     assert "data-paginate" in page
+    assert _wcswidth("Привет") == 6
+    assert _wcswidth("Ａ") == 2
+    assert _wcswidth("e\u0301") == 1
+    assert len(_ascii_banner("WATSON")) == 5
+    assert _wrap("x" * 50, 10) == ["x" * 10] * 5
+    assert all(_wcswidth(line) <= 12 for line in _wrap("слово " * 20, 12))
+    assert _clip("abcdef", 3) == "abc"
+    assert default_output_path("email", "a@b.com", "html").endswith(".html")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1221,6 +2279,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv", help="сохранить CSV")
     parser.add_argument("--no-cache", action="store_true", help="удалить локальный HTTP-кэш перед запуском")
     parser.add_argument("--self-test", action="store_true", help="запустить встроенную проверку")
+    parser.add_argument("--bot", action="store_true", help="запустить Watson как Telegram-бот (long polling)")
+    parser.add_argument("--bot-token", help="токен Telegram-бота (или WATSON_TELEGRAM_BOT_TOKEN)")
+    parser.add_argument("--tui", action="store_true", help="запустить интерактивный интерфейс (по умолчанию без аргументов)")
+    parser.add_argument("--no-tui", action="store_true", help="не запускать интерактивный интерфейс")
     ns = parser.parse_args(argv)
     if ns.self_test:
         self_test()
@@ -1229,6 +2291,13 @@ def main(argv: list[str] | None = None) -> int:
     if ns.no_cache and CACHE_DB.exists():
         CACHE_DB.unlink()
 
+    token = ns.bot_token or os.getenv("WATSON_TELEGRAM_BOT_TOKEN")
+    has_target = bool(ns.args or ns.file or ns.export or ns.evidence or ns.telegram_id)
+    launch_bot = ns.bot or (bool(token) and not has_target)
+    if launch_bot and token:
+        return run_telegram_bot(token, ns.deep, ns.sherlock, ns.maigret, not ns.no_breach)
+    if launch_bot and not token:
+        parser.error("для режима бота нужен --bot-token или WATSON_TELEGRAM_BOT_TOKEN")
     targets = read_targets(ns.file) if ns.file else []
     if ns.export:
         targets.append(("export", ns.export))
@@ -1242,7 +2311,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             value = " ".join(ns.args)
             targets.append((detect(value), value))
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if not targets:
+        if (ns.tui or interactive) and not ns.no_tui:
+            if curses is None:
+                parser.error("интерактивный режим недоступен: модуль curses не найден")
+            return run_tui({"deep": ns.deep, "sherlock": ns.sherlock, "maigret": ns.maigret, "breach": not ns.no_breach})
         parser.error("укажите цель, --export или --file")
 
     reports = []
