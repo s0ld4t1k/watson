@@ -1,0 +1,20 @@
+# Watson core runs on the Python standard library only.
+# Everything below is optional and enables one feature each.
+# Install all extras:  pip install -r requirements.txt
+# Minimal install:     no packages needed, just run watson.py
+
+# Phone numbers: format, region, carrier and line type
+phonenumbers>=8.13
+
+# Telegram --deep via your own Telethon session
+telethon>=1.36
+
+# Username sweep through external tools
+sherlock-project>=0.15
+maigret>=0.5
+
+# Email investigation: MailAccess "investigate" mode
+mailaccess>=0.19
+
+# PDF reports. Also needs system Pango/Cairo libraries (see README).
+weasyprint>=62

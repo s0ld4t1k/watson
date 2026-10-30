@@ -18,6 +18,7 @@ import html
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -536,6 +537,306 @@ def scan_email(target: str) -> dict:
     return rep
 
 
+# Email investigation (MailAccess-compatible) ---------------------------------
+# MailAccess is an optional external engine: https://github.com/KatrielMoses/MailAccess
+# When it is installed, Watson runs its "investigate" command and folds the
+# graded findings into a normal Watson report. Without it, Watson falls back to
+# a small built-in set of public, logged-out checks.
+
+MAILACCESS_TIMEOUT = 600
+MAILACCESS_ACCOUNT_MODULES = {
+    "account_discovery",
+    "browser_account_probe",
+    "breach_deep",
+    "fediverse_discovery",
+    "github_code_search",
+    "github_commits",
+    "google_account_intel",
+    "gravatar",
+    "gravatar_lookup",
+    "hackernews",
+    "keybase",
+    "messaging_hints",
+    "npm_discovery",
+    "orcid_lookup",
+    "outlook_autodiscover",
+    "pgp_keyserver",
+    "phone_intel",
+    "pypi_discovery",
+    "social",
+    "social_discovery",
+    "social_links",
+    "username_platforms",
+    "username_pivot",
+}
+CONFIDENCE_RU = {
+    "confirmed": "подтверждено",
+    "high": "высокая",
+    "likely": "вероятно",
+    "medium": "средняя",
+    "possible": "возможно",
+    "low": "низкая",
+    "username match": "совпадение ника",
+    "unknown": "неизвестно",
+}
+CONFIDENCE_RANK = {"confirmed": 0, "high": 1, "likely": 2, "medium": 3, "possible": 4, "low": 5, "username match": 6}
+SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+
+def mailaccess_binary() -> str | None:
+    override = os.getenv("WATSON_MAILACCESS_BIN", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if path.is_file():
+            return str(path)
+        return shutil.which(override)
+    return shutil.which("mailaccess")
+
+
+def _mailaccess_payload(stdout: str) -> dict:
+    """Extract the JSON object from MailAccess stdout, tolerating stray lines."""
+    text = stdout.strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("в выводе нет JSON-объекта")
+    data = json.loads(text[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("JSON-ответ не является объектом")
+    return data
+
+
+def run_mailaccess(address: str) -> tuple[dict | None, str]:
+    """Run `mailaccess investigate` and return its report, or (None, reason)."""
+    binary = mailaccess_binary()
+    if not binary:
+        return None, "не установлен"
+    command = [binary, "--local-only", "--no-banner", "investigate", address, "--format", "json"]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=MAILACCESS_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"не завершился за {MAILACCESS_TIMEOUT} с"
+    except OSError as exc:
+        return None, str(exc)
+    # MailAccess returns 0 for a completed run, 1 when the run failed but a
+    # report object is still available, and 2 for active breaches in some
+    # versions; all three carry parseable JSON.
+    if proc.returncode not in (0, 1, 2):
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:300]}" if detail else ""
+        return None, f"код {proc.returncode}{suffix}"
+    try:
+        return _mailaccess_payload(proc.stdout), ""
+    except (TypeError, ValueError) as exc:
+        return None, f"не удалось разобрать JSON ({exc})"
+
+
+def _mailaccess_items(data: dict) -> list[tuple[str, dict]]:
+    items: list[tuple[str, dict]] = []
+    by_module = data.get("findings_by_module")
+    if isinstance(by_module, dict) and by_module:
+        for module, findings in by_module.items():
+            if not isinstance(findings, list):
+                continue
+            for finding in findings:
+                if isinstance(finding, dict):
+                    items.append((str(module), finding))
+    else:
+        for finding in data.get("findings") or []:
+            if isinstance(finding, dict):
+                items.append((str(finding.get("module") or "findings"), finding))
+    return items
+
+
+def _finding_platform(module: str, finding: dict) -> str:
+    return str(
+        finding.get("platform")
+        or finding.get("service")
+        or finding.get("source")
+        or finding.get("site")
+        or module
+    ).strip()
+
+
+def _finding_url(finding: dict) -> str:
+    metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
+    url = str(
+        finding.get("url")
+        or finding.get("profile_url")
+        or finding.get("link")
+        or metadata.get("profile_url")
+        or metadata.get("url")
+        or ""
+    ).strip()
+    return url if url.lower().startswith(("http://", "https://")) else ""
+
+
+def _finding_names(finding: dict) -> list[str]:
+    metadata = finding.get("metadata")
+    if not isinstance(metadata, dict):
+        return []
+    names = []
+    for key in ("display_name", "full_name", "name", "username", "login", "handle"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            names.append(value.strip())
+    return names
+
+
+def apply_mailaccess_report(rep: dict, data: dict) -> None:
+    """Fold a MailAccess report into Watson's finding/link layout."""
+    status = str(data.get("status") or "").lower()
+    add(rep, "MailAccess: статус", data.get("status"))
+    if status == "failed":
+        rep["notes"].append("MailAccess сообщил о неудачном прогоне: результаты неполные.")
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    score = data.get("exposure_score", summary.get("exposure_score"))
+    add(rep, "MailAccess: exposure score", score)
+    add(rep, "MailAccess: уровень риска", data.get("risk_level", summary.get("risk_level")))
+    add(rep, "MailAccess: email после нормализации", data.get("canonical_email"))
+
+    items = _mailaccess_items(data)
+    add(rep, "MailAccess: всего находок", len(items))
+    counts: dict[str, int] = {}
+    for module, _ in items:
+        counts[module] = counts.get(module, 0) + 1
+    if counts:
+        ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        shown = ", ".join(f"{module} ({count})" for module, count in ordered[:12])
+        if len(ordered) > 12:
+            shown += f" и ещё {len(ordered) - 12} модулей"
+        add(rep, "MailAccess: модули с находками", shown)
+
+    details = [
+        (module, finding)
+        for module, finding in items
+        if module in MAILACCESS_ACCOUNT_MODULES
+    ]
+    details.sort(
+        key=lambda item: (
+            CONFIDENCE_RANK.get(str(item[1].get("confidence", "unknown")).lower(), 9),
+            SEVERITY_RANK.get(str(item[1].get("severity", "info")).lower(), 9),
+        )
+    )
+    seen: set[tuple[str, str]] = set()
+    names: list[str] = []
+    for module, finding in details:
+        platform = _finding_platform(module, finding)
+        url = _finding_url(finding)
+        key = (platform, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        confidence = str(finding.get("confidence") or "").lower()
+        grade = CONFIDENCE_RU.get(confidence, confidence)
+        label = f"MailAccess: аккаунт {platform}" + (f" ({grade})" if grade else "")
+        if len(seen) <= 30:
+            add(rep, label, url or "найден")
+        if url:
+            rep["links"].append((f"MailAccess: {platform}", url))
+        for name in _finding_names(finding):
+            if name not in names:
+                names.append(name)
+    for name in names[:3]:
+        add(rep, "MailAccess: возможное имя/логин", name)
+
+    if len(seen) > 30:
+        add(rep, "MailAccess: аккаунтов показано", f"30 из {len(seen)}; полный список — в отчёте MailAccess")
+    if items:
+        rep["notes"].append("MailAccess проверяет публичные страницы регистрации/входа; оценка уверенности — его эвристика, а не доказательство владения адресом.")
+    else:
+        rep["notes"].append("MailAccess не вернул находок: это не подтверждает отсутствие аккаунтов.")
+
+
+def builtin_email_accounts(rep: dict, address: str) -> None:
+    """Small public fallback when the MailAccess CLI is not installed."""
+    digest = hashlib.md5(address.strip().lower().encode()).hexdigest()
+
+    status, data = fetch_json(f"https://www.gravatar.com/{digest}.json", timeout=10)
+    profile = None
+    if isinstance(data, dict):
+        entry = data.get("entry")
+        if isinstance(entry, list) and entry and isinstance(entry[0], dict):
+            profile = entry[0]
+        elif data.get("displayName") or data.get("preferredUsername"):
+            profile = data
+    if profile:
+        name = str(profile.get("displayName") or profile.get("preferredUsername") or "").strip()
+        add(rep, "Gravatar: профиль", name or "найден")
+        rep["links"].append(("Gravatar: профиль", f"https://gravatar.com/{digest}"))
+        accounts = profile.get("accounts")
+        if isinstance(accounts, list) and accounts:
+            add(rep, "Gravatar: привязанные аккаунты", len(accounts))
+
+    status, data = fetch_json(
+        "https://keybase.io/_/api/1.0/user/lookup.json?email=" + quote(address),
+        timeout=10,
+    )
+    if isinstance(data, dict):
+        status_obj = data.get("status") if isinstance(data.get("status"), dict) else {}
+        if status_obj.get("code") == 0:
+            them = data.get("them")
+            users = them if isinstance(them, list) else [them] if isinstance(them, dict) else []
+            for user in users:
+                basics = user.get("basics") if isinstance(user, dict) else None
+                if not isinstance(basics, dict) or not basics.get("username"):
+                    continue
+                username = str(basics["username"])
+                add(rep, "Keybase: аккаунт", username)
+                rep["links"].append(("Keybase: профиль", f"https://keybase.io/{quote(username)}"))
+
+    status, data = fetch_json(
+        "https://api.github.com/search/users?q=" + quote(address) + "+in:email",
+        timeout=10,
+        headers={"Accept": "application/vnd.github+json"},
+    )
+    if isinstance(data, dict):
+        found = data.get("items") if isinstance(data.get("items"), list) else []
+        for item in found[:5]:
+            if not isinstance(item, dict) or not item.get("login"):
+                continue
+            login = str(item["login"])
+            add(rep, "GitHub: аккаунт", login)
+            url = str(item.get("html_url") or f"https://github.com/{quote(login)}")
+            rep["links"].append(("GitHub: профиль", url))
+        total = data.get("total_count")
+        if isinstance(total, int) and total > 5:
+            add(rep, "GitHub: всего совпадений", total)
+    elif status in (403, 429):
+        rep["notes"].append("GitHub: лимит публичного поиска исчерпан, повторите позже.")
+
+    status, body = fetch("https://keys.openpgp.org/vks/v1/by-email/" + quote(address), timeout=10)
+    if status == 200 and body.strip():
+        add(rep, "OpenPGP: ключ", "найден")
+        rep["links"].append(("OpenPGP: ключ", "https://keys.openpgp.org/search?q=" + quote(address)))
+
+
+def scan_mailaccess(target: str) -> dict:
+    address = target.strip()
+    rep = new_report("Email-расследование (MailAccess)", address)
+    remember(rep, "emails", address)
+    domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
+    add(rep, "Домен", domain)
+    rep["links"] += email_social_links(address)
+
+    data, error = run_mailaccess(address)
+    if data:
+        add(rep, "MailAccess: движок", "MailAccess CLI")
+        apply_mailaccess_report(rep, data)
+    else:
+        add(rep, "MailAccess: движок", "встроенная проверка")
+        if error and error != "не установлен":
+            rep["notes"].append(f"MailAccess: {error}.")
+        rep["notes"].append(
+            "Полный прогон MailAccess: pip install mailaccess. "
+            "Сейчас выполнены встроенные публичные проверки Gravatar, Keybase, GitHub и OpenPGP."
+        )
+        builtin_email_accounts(rep, address)
+
+    rep["notes"].append("Аккаунт, найденный по email, — зацепка для проверки, а не доказательство владения адресом.")
+    return rep
+
+
+
 USER_SITES = {
     "GitHub": "https://github.com/{}",
     "GitLab": "https://gitlab.com/{}",
@@ -1033,12 +1334,12 @@ def detect(value: str) -> str:
     return "user"
 
 
-SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "image": scan_image, "export": scan_export, "evidence": scan_evidence, "breach": scan_breach}
+SCANNERS = {"tg": scan_telegram, "id": scan_id, "phone": scan_phone, "email": scan_email, "user": scan_username, "domain": scan_domain, "crypto": scan_crypto, "image": scan_image, "export": scan_export, "evidence": scan_evidence, "breach": scan_breach, "mailaccess": scan_mailaccess, "investigate": scan_mailaccess}
 
 
 def run(kind: str, target: str, deep: bool = False, sherlock: bool = False, maigret: bool = False, breach: bool = True) -> dict:
     rep = SCANNERS[kind](target)
-    if breach and kind in ("tg", "email", "user"):
+    if breach and kind in ("tg", "email", "user", "mailaccess", "investigate"):
         add_breach_signals(rep, telegram_slug(target) if kind == "tg" else target)
     if kind in ("tg", "id") and deep:
         deep_telegram(rep, telegram_slug(target))
@@ -1403,7 +1704,7 @@ def send_telegram_message(token: str, chat_id, text: str) -> None:
 def bot_help_text() -> str:
     return (
         "Watson — OSINT-триаж. Отправьте цель одной строкой: @username, +7..., email, домен, адрес, /path/image.jpg или id 12345.\n"
-        "Команды: /help, /scan <цель>, /deep доступен только в CLI.\n"
+        "Команды: /help, /scan <цель>, /scan mailaccess <email> (аккаунты по email), /deep доступен только в CLI.\n"
         "Оценка эвристическая, не доказательство."
     )
 
@@ -1461,6 +1762,7 @@ KIND_INFO = [
     ("id", "Telegram ID", "числовой ID, оценка даты регистрации"),
     ("phone", "Телефон", "+7…, соцсети и мессенджеры"),
     ("email", "Email", "адрес, домены, утечки"),
+    ("mailaccess", "Email-расследование", "аккаунты по email (MailAccess)"),
     ("user", "Username", "ник для Sherlock / Maigret"),
     ("domain", "Домен или сайт", "example.com"),
     ("crypto", "Крипто-адрес", "BTC, ETH, USDT"),
@@ -2259,11 +2561,34 @@ def self_test() -> None:
     assert all(_wcswidth(line) <= 12 for line in _wrap("слово " * 20, 12))
     assert _clip("abcdef", 3) == "abc"
     assert default_output_path("email", "a@b.com", "html").endswith(".html")
+    assert "mailaccess" in SCANNERS and SCANNERS["investigate"] is scan_mailaccess
+    payload = _mailaccess_payload('шум\n{"status": "complete", "findings_by_module": {}}\nхвост')
+    assert payload["status"] == "complete"
+    ma = new_report("Тест", "a@b.com")
+    apply_mailaccess_report(ma, {
+        "status": "complete",
+        "exposure_score": 12,
+        "risk_level": "medium",
+        "findings_by_module": {
+            "account_discovery": [{
+                "platform": "Example",
+                "url": "https://example.test/u/1",
+                "confidence": "high",
+                "metadata": {"username": "demo"},
+            }],
+            "hibp": [{"platform": "HIBP", "confidence": "high"}],
+        },
+    })
+    labels = [label for label, _ in ma["findings"]]
+    values = " ".join(value for _, value in ma["findings"])
+    assert any("Example" in label for label in labels)
+    assert ("MailAccess: Example", "https://example.test/u/1") in ma["links"]
+    assert "hibp" in values.lower()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Watson — OSINT-триаж по открытым источникам и собственным экспортам")
-    parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|id|phone|email|user|domain|crypto|export|evidence|breach)")
+    parser.add_argument("args", nargs="*", help="цель или: тип цель (tg|id|phone|email|mailaccess|user|domain|crypto|export|evidence|breach)")
     parser.add_argument("-f", "--file", help="файл целей, по одной в строке")
     parser.add_argument("--export", help="Telegram Desktop JSON-экспорт")
     parser.add_argument("--evidence", action="append", metavar="PATH", help="локальный JSON/CSV/TXT-материал расследования; можно указать несколько раз")

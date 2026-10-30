@@ -15,39 +15,104 @@
 
 ## Установка
 
-Скрипт одиночный и использует только стандартную библиотеку Python:
+Watson — одиночный Python-скрипт. Ядро работает на стандартной библиотеке, поэтому запускается сразу после клонирования. Пакеты из `requirements.txt` необязательны: каждый включает отдельную возможность.
 
-```sh
-git clone <repo-url> && cd watson
-python3 watson.py --self-test   # должно вывести: ok
-```
+### 1. Требования
 
-Требования:
-
-- Python 3.10 или новее;
+- Python 3.10 или новее — проверьте: `python3 --version`;
+- `git`;
 - интернет для публичных проверок;
 - JSON-экспорт Telegram Desktop — только для режима `--export`.
 
-Необязательные пакеты нужны лишь для отдельных возможностей:
+На Windows вместо `python3` используйте `python`, а вместо `source .venv/bin/activate` — `.venv\Scripts\Activate.ps1` (PowerShell) или `.venv\Scripts\activate.bat` (cmd).
+
+### 2. Клонирование
+
+```sh
+git clone <repo-url>
+cd watson
+```
+
+### 3. Виртуальное окружение (рекомендуется)
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 4. Зависимости
+
+```sh
+python3 -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Если нужен только базовый режим, этот шаг можно пропустить. Если полный набор не нужен, ставьте пакеты по одному:
 
 ```sh
 pip install phonenumbers        # расширенная проверка телефонов
 pip install telethon            # Telegram API через --deep
+pip install sherlock-project    # Sherlock (--sherlock)
+pip install maigret             # Maigret (--maigret)
+pip install mailaccess          # email-расследование (mailaccess / investigate)
 pip install weasyprint          # экспорт в PDF
-pip install maigret             # поиск username по множеству сайтов
-pip install sherlock-project    # Sherlock
 ```
 
-Ключи API тоже необязательны и нужны только для breach-проверок:
+Для PDF на macOS дополнительно нужны системные библиотеки:
+
+```sh
+brew install pango libffi
+```
+
+На Debian/Ubuntu:
+
+```sh
+sudo apt install libpango-1.0-0 libpangoft2-1.0-0
+```
+
+Без `weasyprint` HTML-отчёт и печать в PDF из браузера работают как обычно.
+
+### 5. Проверка установки
+
+```sh
+python3 watson.py --self-test   # должно вывести: ok
+python3 watson.py --help
+```
+
+### 6. Ключи API (необязательно)
+
+Ключи нужны только для расширенных breach-проверок:
 
 ```sh
 export WATSON_HIBP_API_KEY=your_api_key   # https://haveibeenpwned.com/API/Key
 export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io
 ```
 
+В PowerShell:
+
+```powershell
+$env:WATSON_HIBP_API_KEY = "your_api_key"
+$env:WATSON_LEAKCHECK_KEY = "your_api_key"
+```
+
+### 7. Первый запуск
+
+```sh
+python3 watson.py                                  # интерактивный TUI
+python3 watson.py person@example.org               # обычная проверка email
+python3 watson.py mailaccess person@example.org    # аккаунты по email
+```
+
+### Обновление
+
+```sh
+git pull
+pip install -r requirements.txt --upgrade
+```
+
 ## Как пользоваться
 
-Цель можно указать без типа — тип определяется автоматически. Либо задать его явно: `python3 watson.py <тип> <цель>`, где тип — `tg`, `id`, `phone`, `email`, `user`, `domain`, `crypto`, `export`, `evidence`, `breach`.
+Цель можно указать без типа — тип определяется автоматически. Либо задать его явно: `python3 watson.py <тип> <цель>`, где тип — `tg`, `id`, `phone`, `email`, `mailaccess`, `user`, `domain`, `crypto`, `export`, `evidence`, `breach`.
 
 ```sh
 python3 watson.py @some_user                     # Telegram username
@@ -56,6 +121,7 @@ python3 watson.py --id 1973230366                # Telegram ID
 python3 watson.py id 1973230366                  # то же явно
 python3 watson.py phone +79991234567             # телефон
 python3 watson.py person@example.org             # email (+ breach-статус)
+python3 watson.py mailaccess person@example.org  # аккаунты по email (MailAccess)
 python3 watson.py domain example.com             # домен
 python3 watson.py user some_name                 # username на площадках
 python3 watson.py crypto 0x0000...0000           # крипто-адрес
@@ -166,6 +232,21 @@ Watson сохраняет email как индикатор, показывает 
 
 Для email и username автоматически запрашивается breach-статус (см. ниже); отключается флагом `--no-breach`.
 
+### Email-расследование (MailAccess)
+
+```sh
+python3 watson.py mailaccess person@example.org
+python3 watson.py investigate person@example.org   # то же, алиас
+```
+
+Режим отвечает на вопрос «какие публичные аккаунты и профили связаны с этим адресом». Он совместим с открытым движком [MailAccess](https://github.com/KatrielMoses/MailAccess):
+
+- если `mailaccess` установлен (`pip install mailaccess`), Watson запускает `mailaccess --local-only investigate <email>` и переносит в отчёт найденные аккаунты, профили, имена/логины и оценки уверенности, не загружая сырые дампы;
+- если CLI нет, выполняется встроенная облегчённая проверка публичных источников: Gravatar, Keybase, GitHub и OpenPGP-keyserver, плюс обычный breach-статус;
+- путь к нестандартному бинарнику можно задать через `WATSON_MAILACCESS_BIN`.
+
+Проверки идут по публичным страницам регистрации и входа, без доступа к чужому ящику и без попыток подбора пароля. Найденный аккаунт остаётся зацепкой: совпадение адреса не доказывает, что профиль принадлежит тому же человеку.
+
 ### Breach-статус
 
 Watson умеет отвечать на вопрос «где и когда этот идентификатор уже попадал в публичные утечки» — названиями утечек, датами и перечнем утёкших категорий полей. **Сами значения полей (имена, адреса, пароли) не запрашиваются и не выводятся.**
@@ -270,7 +351,7 @@ python3 watson.py --file targets.txt
 python3 watson.py -f targets.txt --deep
 ```
 
-Поддерживаемые явные типы: `tg`, `id`, `phone`, `email`, `user`, `domain`, `crypto`, `export`, `evidence`, `breach`.
+Поддерживаемые явные типы: `tg`, `id`, `phone`, `email`, `mailaccess`, `user`, `domain`, `crypto`, `export`, `evidence`, `breach`.
 
 ### Материалы расследования и корреляция
 
