@@ -1202,18 +1202,25 @@ def hibp_breaches(email: str) -> dict:
     return result
 
 
+def leakcheck_lookup(query: str, kind: str | None = None) -> dict:
+    """LeakCheck Pro when a key is configured, otherwise the free public API."""
+    if os.getenv("WATSON_LEAKCHECK_KEY"):
+        return leakcheck_pro(query, kind=kind)
+    return leakcheck_public(query)
+
+
 def add_breach_signals(rep: dict, identifier: str) -> None:
     value = str(identifier or "").strip()
     if not value:
         return
     kind = breach_kind(value)
     if kind == "phone":
-        results = []
-        if os.getenv("WATSON_LEAKCHECK_KEY"):
-            results.append(leakcheck_pro(value, kind='phone'))
-        if not results:
-            rep["notes"].append("Бесплатные breach-источники по номеру телефона недоступны; при наличии WATSON_LEAKCHECK_KEY Watson проверит LeakCheck Pro (он поддерживает номер).")
-            return
+        if not os.getenv("WATSON_LEAKCHECK_KEY"):
+            rep["notes"].append(
+                "LeakCheck Public API документирован для email и username; "
+                "для телефона он может не найти совпадений. Pro-ключ WATSON_LEAKCHECK_KEY расширяет покрытие."
+            )
+        results = [leakcheck_lookup(value, kind="phone")]
         # Handle only the collected phone results below instead of the usual email/username path.
         total, consulted, classes = 0, [], set()
         for item in results:
@@ -1248,13 +1255,11 @@ def add_breach_signals(rep: dict, identifier: str) -> None:
                 flag(rep, 1, "Среди утёкших категорий — пароли: возможно повторное использование учёток")
         return
     query = value.lstrip("@") if kind == "username" else value
-    results = [leakcheck_public(query)]
+    results = [leakcheck_lookup(query, kind=kind if kind in ("email", "username") else None)]
     if kind == "email":
         results.append(xposedornot_breaches(value))
         if os.getenv("WATSON_HIBP_API_KEY"):
             results.append(hibp_breaches(value))
-    if os.getenv("WATSON_LEAKCHECK_KEY"):
-        results.append(leakcheck_pro(query, kind=kind if kind in ('email', 'username', 'phone') else None))
 
     total, consulted, classes = 0, [], set()
     for item in results:

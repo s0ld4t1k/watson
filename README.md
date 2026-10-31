@@ -85,7 +85,7 @@ python3 watson.py --help
 
 ```sh
 export WATSON_HIBP_API_KEY=your_api_key   # https://haveibeenpwned.com/API/Key
-export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io
+export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io; без ключа используется public API
 ```
 
 В PowerShell:
@@ -262,14 +262,14 @@ python3 watson.py person@example.org --no-breach  # без breach-проверк
 
 | Источник | Что нужно | Что возвращает |
 | --- | --- | --- |
-| LeakCheck Public | ключа нет | записи, названия утечек, даты, категории полей |
+| LeakCheck Public | ключа нет, используется автоматически | записи, названия утечек, даты, категории полей (email/username) |
 | XposedOrNot | ключа нет, только email | список утечек, оценка риска, качество паролей |
 | HIBP | `WATSON_HIBP_API_KEY` | название утечки, дата, `DataClasses` |
 | LeakCheck Pro | `WATSON_LEAKCHECK_KEY` | то же, плюс phone/domain и info-stealer логи |
 
 ```sh
 export WATSON_HIBP_API_KEY=your_api_key   # https://haveibeenpwned.com/API/Key
-export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io
+export WATSON_LEAKCHECK_KEY=your_api_key  # https://leakcheck.io; без ключа используется public API
 ```
 
 Ограничения источников: бесплатные API не ищут по номеру телефона; у XposedOrNot лимит 25 запросов в час. При rate limit в отчёте появится заметка, а не ошибка. Совпадения по username показываются, но не входят в оценку риска — ник не уникален между сервисами, поэтому это слабая зацепка.
